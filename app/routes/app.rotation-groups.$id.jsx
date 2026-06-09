@@ -1,52 +1,68 @@
-import { Form, redirect, useLoaderData, useActionData, useNavigation, useFetcher } from "react-router";
+import { useState } from "react";
+import { redirect, useLoaderData, useFetcher } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
 import db from "../db.server";
 
+// ─── Loader ───────────────────────────────────────────────────────────────────
+
 export const loader = async ({ request, params }) => {
-  const { session } = await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
   const shop = session.shop;
+  const url = new URL(request.url);
+  const q = url.searchParams.get("q")?.trim();
 
   const group = await db.rotationGroup.findFirst({
     where: { id: params.id, shop },
-    include: { items: { orderBy: { position: "asc" } } },
+    include: { rotationItems: { orderBy: { sortOrder: "asc" } } },
   });
 
   if (!group) throw new Response("Not Found", { status: 404 });
+
+  let searchProducts = [];
+  if (q) {
+    const res = await admin.graphql(`
+      query SearchProducts($query: String!) {
+        products(first: 8, query: $query) {
+          nodes {
+            id title
+            featuredImage { url }
+            variants(first: 50) { nodes { id title price } }
+          }
+        }
+      }
+    `, { variables: { query: q } });
+    const json = await res.json();
+    searchProducts = json.data?.products?.nodes ?? [];
+  }
 
   return {
     group: {
       ...group,
       createdAt: group.createdAt.toISOString(),
       updatedAt: group.updatedAt.toISOString(),
-      items: group.items.map((item) => ({
-        ...item,
-        createdAt: item.createdAt.toISOString(),
-        updatedAt: item.updatedAt.toISOString(),
+      rotationItems: group.rotationItems.map((i) => ({
+        ...i,
+        createdAt: i.createdAt.toISOString(),
+        updatedAt: i.updatedAt.toISOString(),
       })),
     },
+    searchProducts,
   };
 };
+
+// ─── Action ───────────────────────────────────────────────────────────────────
 
 export const action = async ({ request, params }) => {
   const { session } = await authenticate.admin(request);
   const shop = session.shop;
-  const formData = await request.formData();
-  const intent = formData.get("intent");
+  const fd = await request.formData();
+  const intent = fd.get("intent");
 
   if (intent === "updateGroup") {
-    const name = formData.get("name")?.toString().trim();
-    const description = formData.get("description")?.toString().trim();
-    const isActive = formData.get("isActive") === "true";
-
-    if (!name) return { errors: { name: "Group name is required" } };
-
-    await db.rotationGroup.updateMany({
-      where: { id: params.id, shop },
-      data: { name, description: description || null, isActive },
-    });
-
-    return { success: "Group updated successfully" };
+    const isActive = fd.get("isActive") === "true";
+    await db.rotationGroup.updateMany({ where: { id: params.id, shop }, data: { isActive } });
+    return { success: "Group settings saved." };
   }
 
   if (intent === "deleteGroup") {
@@ -55,382 +71,477 @@ export const action = async ({ request, params }) => {
   }
 
   if (intent === "addItem") {
-    const productId = formData.get("productId")?.toString().trim();
-    const productTitle = formData.get("productTitle")?.toString().trim();
-    const variantId = formData.get("variantId")?.toString().trim();
-    const variantTitle = formData.get("variantTitle")?.toString().trim();
-    const price = formData.get("price")?.toString().trim();
-    const imageUrl = formData.get("imageUrl")?.toString().trim();
+    const productId    = fd.get("productId")?.toString().trim();
+    const variantId    = fd.get("variantId")?.toString().trim();
+    const productTitle = fd.get("productTitle")?.toString().trim();
+    const variantTitle = fd.get("variantTitle")?.toString().trim();
+    const price        = fd.get("price")?.toString().trim();
+    const imageUrl     = fd.get("imageUrl")?.toString().trim();
 
-    if (!productId || !productTitle) {
-      return { errors: { item: "Product ID and Product Title are required" } };
-    }
+    if (!productId || !variantId || !productTitle) return { error: "Select a product and variant." };
 
-    const maxPosition = await db.rotationItem.aggregate({
+    const max = await db.rotationItem.aggregate({
       where: { rotationGroupId: params.id },
-      _max: { position: true },
+      _max: { sortOrder: true },
     });
-    const nextPosition = (maxPosition._max.position ?? -1) + 1;
+    const nextOrder = (max._max.sortOrder ?? -1) + 1;
 
     await db.rotationItem.create({
-      data: {
-        rotationGroupId: params.id,
-        productId,
-        productTitle,
-        variantId: variantId || null,
-        variantTitle: variantTitle || null,
-        price: price || null,
-        imageUrl: imageUrl || null,
-        position: nextPosition,
-      },
+      data: { rotationGroupId: params.id, productId, variantId, productTitle, variantTitle: variantTitle || null, price: price || null, imageUrl: imageUrl || null, sortOrder: nextOrder, isActive: true },
     });
+    return { success: "Item added to rotation." };
+  }
 
-    return { success: "Item added" };
+  if (intent === "toggleItem") {
+    const itemId = fd.get("itemId");
+    const item = await db.rotationItem.findUnique({ where: { id: itemId } });
+    if (item) await db.rotationItem.update({ where: { id: itemId }, data: { isActive: !item.isActive } });
+    return null;
   }
 
   if (intent === "deleteItem") {
-    const itemId = formData.get("itemId");
+    const itemId = fd.get("itemId");
     await db.rotationItem.delete({ where: { id: itemId } });
-
-    // Re-sequence positions
-    const remaining = await db.rotationItem.findMany({
-      where: { rotationGroupId: params.id },
-      orderBy: { position: "asc" },
-    });
-    await Promise.all(
-      remaining.map((item, idx) =>
-        db.rotationItem.update({ where: { id: item.id }, data: { position: idx } })
-      )
-    );
-
-    return { success: "Item removed" };
+    const remaining = await db.rotationItem.findMany({ where: { rotationGroupId: params.id }, orderBy: { sortOrder: "asc" } });
+    await Promise.all(remaining.map((item, idx) => db.rotationItem.update({ where: { id: item.id }, data: { sortOrder: idx } })));
+    return null;
   }
 
   if (intent === "moveItem") {
-    const itemId = formData.get("itemId");
-    const direction = formData.get("direction"); // "up" | "down"
-
-    const items = await db.rotationItem.findMany({
-      where: { rotationGroupId: params.id },
-      orderBy: { position: "asc" },
-    });
-
+    const itemId = fd.get("itemId");
+    const dir = fd.get("direction");
+    const items = await db.rotationItem.findMany({ where: { rotationGroupId: params.id }, orderBy: { sortOrder: "asc" } });
     const idx = items.findIndex((i) => i.id === itemId);
-    const swapIdx = direction === "up" ? idx - 1 : idx + 1;
-
+    const swapIdx = dir === "up" ? idx - 1 : idx + 1;
     if (swapIdx < 0 || swapIdx >= items.length) return null;
-
     await Promise.all([
-      db.rotationItem.update({ where: { id: items[idx].id }, data: { position: items[swapIdx].position } }),
-      db.rotationItem.update({ where: { id: items[swapIdx].id }, data: { position: items[idx].position } }),
+      db.rotationItem.update({ where: { id: items[idx].id },     data: { sortOrder: items[swapIdx].sortOrder } }),
+      db.rotationItem.update({ where: { id: items[swapIdx].id }, data: { sortOrder: items[idx].sortOrder } }),
     ]);
-
     return null;
   }
 
   return null;
 };
 
+// ─── Page ─────────────────────────────────────────────────────────────────────
+
 export default function RotationGroupDetail() {
   const { group } = useLoaderData();
-  const actionData = useActionData();
-  const navigation = useNavigation();
-  const isSubmitting = navigation.state === "submitting";
 
   return (
-    <s-page heading={group.name} back-action="/app/rotation-groups">
-      {actionData?.success && (
-        <s-banner tone="success" title={actionData.success} />
-      )}
+    <s-page heading={group.targetProductTitle} back-action="/app/rotation-groups">
 
-      {/* Group Settings */}
-      <s-section heading="Group Settings">
-        <Form method="post">
-          <input type="hidden" name="intent" value="updateGroup" />
-          <s-stack direction="block" gap="400">
-            <div>
-              <label htmlFor="name" style={labelStyle}>
-                Group Name <span style={{ color: "#d82c0d" }}>*</span>
-              </label>
-              <input
-                id="name"
-                name="name"
-                type="text"
-                required
-                defaultValue={group.name}
-                style={inputStyle}
-              />
-              {actionData?.errors?.name && (
-                <p style={errorStyle}>{actionData.errors.name}</p>
-              )}
+      <GroupSettingsSection group={group} />
+      <RotationSequenceSection group={group} />
+
+      {/* ── Aside ─────────────────────────────────────────────────────────── */}
+      <s-section slot="aside" heading="Rotation Logic">
+        <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
+          {[
+            { icon: "✅", text: "Only active items are used in rotation" },
+            { icon: "↕️",  text: "Position determines order; use ▲▼ to reorder" },
+            { icon: "🔀", text: "If variants match subscription variants, each is swapped individually (Case 2)" },
+            { icon: "📦", text: "Otherwise, default variant is used at combined quantity and price (Case 1)" },
+          ].map(({ icon, text }, i) => (
+            <div key={i} style={{ display: "flex", gap: "10px", alignItems: "flex-start" }}>
+              <span style={{ fontSize: "16px", flexShrink: 0 }}>{icon}</span>
+              <span style={{ fontSize: "13px", color: "#303030", lineHeight: "1.5" }}>{text}</span>
             </div>
-
-            <div>
-              <label htmlFor="description" style={labelStyle}>
-                Description
-              </label>
-              <textarea
-                id="description"
-                name="description"
-                rows={3}
-                defaultValue={group.description || ""}
-                style={{ ...inputStyle, resize: "vertical" }}
-              />
-            </div>
-
-            <div>
-              <label style={labelStyle}>Status</label>
-              <s-stack direction="inline" gap="300">
-                <label style={{ display: "flex", alignItems: "center", gap: "6px", cursor: "pointer" }}>
-                  <input type="radio" name="isActive" value="true" defaultChecked={group.isActive} />
-                  <span>Active</span>
-                </label>
-                <label style={{ display: "flex", alignItems: "center", gap: "6px", cursor: "pointer" }}>
-                  <input type="radio" name="isActive" value="false" defaultChecked={!group.isActive} />
-                  <span>Inactive</span>
-                </label>
-              </s-stack>
-            </div>
-
-            <s-stack direction="inline" gap="300">
-              <s-button variant="primary" submit disabled={isSubmitting}>
-                Save Changes
-              </s-button>
-              <Form method="post" style={{ display: "inline" }}>
-                <input type="hidden" name="intent" value="deleteGroup" />
-                <s-button
-                  variant="secondary"
-                  tone="critical"
-                  submit
-                  onClick={(e) => {
-                    if (!confirm("Delete this group? All items and linked subscription data will be removed.")) {
-                      e.preventDefault();
-                    }
-                  }}
-                >
-                  Delete Group
-                </s-button>
-              </Form>
-            </s-stack>
-          </s-stack>
-        </Form>
+          ))}
+        </div>
       </s-section>
 
-      {/* Rotation Items */}
-      <s-section heading={`Rotation Items (${group.items.length})`}>
-        {actionData?.errors?.item && (
-          <s-banner tone="critical" title={actionData.errors.item} />
-        )}
-
-        {group.items.length === 0 ? (
-          <s-paragraph>No items yet. Add products below to build the rotation sequence.</s-paragraph>
-        ) : (
-          <s-box borderWidth="025" borderRadius="200" overflow="hidden">
-            <table style={tableStyle}>
-              <thead>
-                <tr style={theadRowStyle}>
-                  <th style={thStyle}>#</th>
-                  <th style={thStyle}>Product</th>
-                  <th style={thStyle}>Variant</th>
-                  <th style={thStyle}>Price</th>
-                  <th style={thStyle}>Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {group.items.map((item, idx) => (
-                  <ItemRow
-                    key={item.id}
-                    item={item}
-                    idx={idx}
-                    isFirst={idx === 0}
-                    isLast={idx === group.items.length - 1}
-                  />
-                ))}
-              </tbody>
-            </table>
-          </s-box>
-        )}
-
-        {/* Add Item Form */}
-        <s-box padding="400" borderWidth="025" borderRadius="200" background="subdued">
-          <s-heading>Add Rotation Item</s-heading>
-          <Form method="post">
-            <input type="hidden" name="intent" value="addItem" />
-            <s-stack direction="block" gap="300">
-              <s-stack direction="inline" gap="300">
-                <div style={{ flex: 1 }}>
-                  <label htmlFor="productId" style={labelStyle}>
-                    Product ID (GID) <span style={{ color: "#d82c0d" }}>*</span>
-                  </label>
-                  <input
-                    id="productId"
-                    name="productId"
-                    type="text"
-                    required
-                    placeholder="gid://shopify/Product/123456"
-                    style={inputStyle}
-                  />
-                </div>
-                <div style={{ flex: 1 }}>
-                  <label htmlFor="productTitle" style={labelStyle}>
-                    Product Title <span style={{ color: "#d82c0d" }}>*</span>
-                  </label>
-                  <input
-                    id="productTitle"
-                    name="productTitle"
-                    type="text"
-                    required
-                    placeholder="e.g. Coffee Blend A"
-                    style={inputStyle}
-                  />
-                </div>
-              </s-stack>
-
-              <s-stack direction="inline" gap="300">
-                <div style={{ flex: 1 }}>
-                  <label htmlFor="variantId" style={labelStyle}>Variant ID (GID)</label>
-                  <input
-                    id="variantId"
-                    name="variantId"
-                    type="text"
-                    placeholder="gid://shopify/ProductVariant/789"
-                    style={inputStyle}
-                  />
-                </div>
-                <div style={{ flex: 1 }}>
-                  <label htmlFor="variantTitle" style={labelStyle}>Variant Title</label>
-                  <input
-                    id="variantTitle"
-                    name="variantTitle"
-                    type="text"
-                    placeholder="e.g. 250g"
-                    style={inputStyle}
-                  />
-                </div>
-              </s-stack>
-
-              <s-stack direction="inline" gap="300">
-                <div style={{ flex: 1 }}>
-                  <label htmlFor="price" style={labelStyle}>Price</label>
-                  <input
-                    id="price"
-                    name="price"
-                    type="text"
-                    placeholder="e.g. 19.99"
-                    style={inputStyle}
-                  />
-                </div>
-                <div style={{ flex: 1 }}>
-                  <label htmlFor="imageUrl" style={labelStyle}>Image URL</label>
-                  <input
-                    id="imageUrl"
-                    name="imageUrl"
-                    type="url"
-                    placeholder="https://..."
-                    style={inputStyle}
-                  />
-                </div>
-              </s-stack>
-
-              <s-button variant="primary" submit>Add Item</s-button>
-            </s-stack>
-          </Form>
-        </s-box>
+      <s-section slot="aside" heading="Group Info">
+        <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+          <InfoRow label="Group ID"   value={<code style={codeStyle}>{group.id}</code>} />
+          <InfoRow label="Created"    value={new Date(group.createdAt).toLocaleString()} />
+          <InfoRow label="Items"      value={`${group.rotationItems.length} rotation products`} />
+        </div>
       </s-section>
 
-      {/* Subscription Instances */}
-      <s-section slot="aside" heading="Info">
-        <s-stack direction="block" gap="200">
-          <s-paragraph>
-            <s-text fontWeight="semibold">ID: </s-text>
-            <code style={{ fontSize: "12px" }}>{group.id}</code>
-          </s-paragraph>
-          <s-paragraph>
-            <s-text fontWeight="semibold">Created: </s-text>
-            {new Date(group.createdAt).toLocaleString()}
-          </s-paragraph>
-          <s-paragraph>
-            <s-text fontWeight="semibold">Updated: </s-text>
-            {new Date(group.updatedAt).toLocaleString()}
-          </s-paragraph>
-        </s-stack>
-      </s-section>
     </s-page>
   );
 }
 
-function ItemRow({ item, idx, isFirst, isLast }) {
+// ─── Group Settings Section ───────────────────────────────────────────────────
+
+function GroupSettingsSection({ group }) {
   const fetcher = useFetcher();
+  const [isActive, setIsActive] = useState(group.isActive);
+  const isBusy = fetcher.state !== "idle";
 
   return (
-    <tr style={{ borderBottom: "1px solid #e1e3e5" }}>
-      <td style={tdStyle}>
-        <s-badge>{idx + 1}</s-badge>
+    <s-section heading="Group Settings">
+      {fetcher.data?.success && (
+        <div style={successBanner}>{fetcher.data.success}</div>
+      )}
+
+      <div style={{ display: "flex", flexDirection: "column", gap: "20px" }}>
+        {/* Target product info */}
+        <div style={{ background: "#f6f6f7", borderRadius: "8px", padding: "14px 16px" }}>
+          <div style={{ fontSize: "11px", fontWeight: "600", color: "#6d7175", textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: "6px" }}>Target Product</div>
+          <div style={{ fontSize: "15px", fontWeight: "600", color: "#303030", marginBottom: "2px" }}>{group.targetProductTitle}</div>
+          <div style={{ fontFamily: "monospace", fontSize: "11px", color: "#8c9196" }}>{group.targetProductId}</div>
+        </div>
+
+        {/* Status toggle */}
+        <div>
+          <div style={{ fontSize: "13px", fontWeight: "600", color: "#303030", marginBottom: "8px" }}>Status</div>
+          <div style={toggleContainer}>
+            <button type="button" onClick={() => setIsActive(true)}  style={{ ...toggleBtn, ...(isActive ? toggleActiveGreen : {}) }}>Active</button>
+            <button type="button" onClick={() => setIsActive(false)} style={{ ...toggleBtn, ...(!isActive ? toggleActiveRed : {}) }}>Inactive</button>
+          </div>
+          <div style={{ fontSize: "12px", color: "#6d7175", marginTop: "6px" }}>
+            {isActive ? "Rotation is enabled. Renewal orders will be rotated." : "Rotation is paused. Renewal orders will not be modified."}
+          </div>
+        </div>
+
+        {/* Action buttons */}
+        <div style={{ display: "flex", gap: "10px", paddingTop: "4px" }}>
+          <button
+            type="button"
+            onClick={() => fetcher.submit({ intent: "updateGroup", isActive: isActive.toString() }, { method: "post" })}
+            disabled={isBusy}
+            style={isBusy ? { ...primaryBtn, opacity: 0.7 } : primaryBtn}
+          >
+            {isBusy && fetcher.formData?.get("intent") === "updateGroup" ? "Saving…" : "Save Settings"}
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              if (confirm("Delete this rotation group and all its items?\n\nThis cannot be undone. Active subscriptions will no longer be rotated.")) {
+                fetcher.submit({ intent: "deleteGroup" }, { method: "post" });
+              }
+            }}
+            disabled={isBusy}
+            style={criticalBtn}
+          >
+            Delete Group
+          </button>
+        </div>
+      </div>
+    </s-section>
+  );
+}
+
+// ─── Rotation Sequence Section ────────────────────────────────────────────────
+
+function RotationSequenceSection({ group }) {
+  return (
+    <s-section heading={`Rotation Sequence (${group.rotationItems.length} item${group.rotationItems.length !== 1 ? "s" : ""})`}>
+      <div style={{ fontSize: "13px", color: "#6d7175", marginBottom: "20px" }}>
+        Products rotate in order on each renewal. After the last item, the sequence cycles back to position 1.
+      </div>
+
+      {group.rotationItems.length > 0 ? (
+        <div style={{ border: "1px solid #e1e3e5", borderRadius: "8px", marginBottom: "24px" }}>
+          <div style={{ overflowX: "auto" }}>
+          <table style={{ ...tableStyle, minWidth: "680px" }}>
+            <thead>
+              <tr>
+                <th style={th}>#</th>
+                <th style={th}>Product</th>
+                <th style={th}>Default Variant</th>
+                <th style={th}>Price</th>
+                <th style={th}>Status</th>
+                <th style={th}>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {group.rotationItems.map((item, idx) => (
+                <RotationItemRow
+                  key={item.id}
+                  item={item}
+                  idx={idx}
+                  isFirst={idx === 0}
+                  isLast={idx === group.rotationItems.length - 1}
+                />
+              ))}
+            </tbody>
+          </table>
+          </div>
+        </div>
+      ) : (
+        <div style={emptySequence}>
+          <div style={{ fontSize: "32px", marginBottom: "10px" }}>📋</div>
+          <div style={{ fontSize: "14px", fontWeight: "600", color: "#303030", marginBottom: "4px" }}>No rotation items yet</div>
+          <div style={{ fontSize: "13px", color: "#6d7175" }}>Search and add products below to build the rotation sequence</div>
+        </div>
+      )}
+
+      {/* Add item form */}
+      <div style={{ borderTop: "1px solid #e1e3e5", paddingTop: "20px" }}>
+        <div style={{ fontSize: "14px", fontWeight: "600", color: "#303030", marginBottom: "16px" }}>+ Add Rotation Product</div>
+        <AddItemForm />
+      </div>
+    </s-section>
+  );
+}
+
+// ─── Item Row ─────────────────────────────────────────────────────────────────
+
+function RotationItemRow({ item, idx, isFirst, isLast }) {
+  const fetcher = useFetcher();
+  const isBusy = fetcher.state !== "idle";
+
+  const submit = (intent, extra = {}) => {
+    fetcher.submit({ intent, itemId: item.id, ...extra }, { method: "post" });
+  };
+
+  return (
+    <tr style={{ borderBottom: "1px solid #f1f2f3", opacity: isBusy ? 0.6 : 1, transition: "opacity 0.15s" }}>
+      <td style={td}>
+        <div style={posNumber}>{idx + 1}</div>
       </td>
-      <td style={tdStyle}>
-        <s-stack direction="block" gap="050">
-          <strong>{item.productTitle}</strong>
-          <code style={{ fontSize: "11px", color: "#6d7175" }}>
-            {item.productId.split("/").pop()}
-          </code>
-        </s-stack>
+      <td style={td}>
+        <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+          {item.imageUrl
+            ? <img src={item.imageUrl} alt="" style={itemThumb} />
+            : <div style={{ ...itemThumb, background: "#f1f2f3", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "16px" }}>📦</div>
+          }
+          <div>
+            <div style={{ fontSize: "13px", fontWeight: "600", color: "#303030" }}>{item.productTitle}</div>
+            <div style={{ fontSize: "11px", color: "#8c9196", fontFamily: "monospace" }}>{item.productId.split("/").pop()}</div>
+          </div>
+        </div>
       </td>
-      <td style={tdStyle}>
-        {item.variantTitle ? (
-          <s-stack direction="block" gap="050">
-            <span>{item.variantTitle}</span>
-            {item.variantId && (
-              <code style={{ fontSize: "11px", color: "#6d7175" }}>
-                {item.variantId.split("/").pop()}
-              </code>
-            )}
-          </s-stack>
-        ) : "—"}
+      <td style={td}>
+        <div style={{ fontSize: "13px", color: "#303030" }}>{item.variantTitle ?? "Default Title"}</div>
+        <div style={{ fontSize: "11px", color: "#8c9196", fontFamily: "monospace" }}>{item.variantId.split("/").pop()}</div>
       </td>
-      <td style={tdStyle}>{item.price ? `$${item.price}` : "—"}</td>
-      <td style={tdStyle}>
-        <s-stack direction="inline" gap="200">
-          <fetcher.Form method="post">
-            <input type="hidden" name="intent" value="moveItem" />
-            <input type="hidden" name="itemId" value={item.id} />
-            <input type="hidden" name="direction" value="up" />
-            <s-button variant="secondary" size="slim" submit disabled={isFirst}>▲</s-button>
-          </fetcher.Form>
-          <fetcher.Form method="post">
-            <input type="hidden" name="intent" value="moveItem" />
-            <input type="hidden" name="itemId" value={item.id} />
-            <input type="hidden" name="direction" value="down" />
-            <s-button variant="secondary" size="slim" submit disabled={isLast}>▼</s-button>
-          </fetcher.Form>
-          <fetcher.Form method="post">
-            <input type="hidden" name="intent" value="deleteItem" />
-            <input type="hidden" name="itemId" value={item.id} />
-            <s-button
-              variant="secondary"
-              tone="critical"
-              size="slim"
-              submit
-              onClick={(e) => {
-                if (!confirm(`Remove "${item.productTitle}" from rotation?`)) e.preventDefault();
-              }}
-            >
-              Remove
-            </s-button>
-          </fetcher.Form>
-        </s-stack>
+      <td style={td}>
+        <span style={{ fontSize: "13px", fontWeight: "600", color: "#303030" }}>
+          {item.price ? `$${item.price}` : "—"}
+        </span>
+      </td>
+      <td style={td}>
+        <span style={item.isActive ? badgeActive : badgeInactive}>
+          {item.isActive ? "Active" : "Paused"}
+        </span>
+      </td>
+      <td style={{ ...td, whiteSpace: "nowrap" }}>
+        <div style={{ display: "flex", gap: "4px", alignItems: "center" }}>
+          <button type="button" onClick={() => submit("moveItem", { direction: "up" })}   disabled={isFirst || isBusy} style={{ ...iconBtn, opacity: isFirst ? 0.3 : 1 }} title="Move up">▲</button>
+          <button type="button" onClick={() => submit("moveItem", { direction: "down" })} disabled={isLast  || isBusy} style={{ ...iconBtn, opacity: isLast  ? 0.3 : 1 }} title="Move down">▼</button>
+          <button type="button" onClick={() => submit("toggleItem")} disabled={isBusy} style={smallSecBtn} title={item.isActive ? "Pause this item" : "Activate this item"}>
+            {item.isActive ? "Pause" : "Activate"}
+          </button>
+          <button
+            type="button"
+            onClick={() => { if (confirm(`Remove "${item.productTitle}" from rotation?`)) submit("deleteItem"); }}
+            disabled={isBusy}
+            style={smallCritBtn}
+            title="Remove from rotation"
+          >Remove</button>
+        </div>
       </td>
     </tr>
   );
 }
 
-const labelStyle = { display: "block", marginBottom: "6px", fontWeight: "500", fontSize: "14px" };
-const inputStyle = { width: "100%", padding: "8px 12px", border: "1px solid #c9cccf", borderRadius: "6px", fontSize: "14px", boxSizing: "border-box" };
-const errorStyle = { color: "#d82c0d", fontSize: "13px", marginTop: "4px", marginBottom: "0" };
-const tableStyle = { width: "100%", borderCollapse: "collapse", fontSize: "14px" };
-const theadRowStyle = { backgroundColor: "#f6f6f7" };
-const thStyle = { padding: "10px 12px", textAlign: "left", fontWeight: "600", borderBottom: "1px solid #e1e3e5" };
-const tdStyle = { padding: "10px 12px", verticalAlign: "middle" };
+// ─── Add Item Form ────────────────────────────────────────────────────────────
 
-export const headers = (headersArgs) => {
-  return boundary.headers(headersArgs);
-};
+function AddItemForm() {
+  const fetcher = useFetcher();
+  const [query, setQuery] = useState("");
+  const [selectedProduct, setSelectedProduct] = useState(null);
+  const [selectedVariant, setSelectedVariant] = useState(null);
+
+  const searchResults = fetcher.data?.searchProducts ?? [];
+  const isSearching = fetcher.state === "loading";
+  const isAdding    = fetcher.state === "submitting";
+  const showDropdown = searchResults.length > 0 && !selectedProduct;
+
+  function handleSearch(value) {
+    setQuery(value);
+    setSelectedProduct(null);
+    setSelectedVariant(null);
+    if (value.length >= 2) fetcher.load(`?q=${encodeURIComponent(value)}`);
+  }
+
+  function pickProduct(p) {
+    setSelectedProduct(p);
+    setQuery(p.title);
+    if (p.variants?.nodes?.length > 0) setSelectedVariant(p.variants.nodes[0]);
+  }
+
+  function handleAdd() {
+    if (!selectedProduct || !selectedVariant) return;
+    fetcher.submit({
+      intent: "addItem",
+      productId:    selectedProduct.id,
+      variantId:    selectedVariant.id,
+      productTitle: selectedProduct.title,
+      variantTitle: selectedVariant.title,
+      price:        selectedVariant.price,
+      imageUrl:     selectedProduct.featuredImage?.url ?? "",
+    }, { method: "post" });
+    setQuery("");
+    setSelectedProduct(null);
+    setSelectedVariant(null);
+  }
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
+
+      {/* Search input */}
+      <div>
+        <label style={labelStyle}>Search product</label>
+        <div style={{ display: "flex", gap: "8px" }}>
+          <input
+            type="text"
+            value={query}
+            onChange={(e) => handleSearch(e.target.value)}
+            placeholder="Type product name to search…"
+            style={{ ...inputStyle, flex: 1 }}
+            autoComplete="off"
+          />
+          {isSearching && (
+            <div style={{ display: "flex", alignItems: "center", fontSize: "12px", color: "#6d7175", whiteSpace: "nowrap" }}>
+              Searching…
+            </div>
+          )}
+          {(query && !selectedProduct) && (
+            <button type="button" onClick={() => { setQuery(""); setSelectedProduct(null); setSelectedVariant(null); }} style={smallSecBtn}>✕</button>
+          )}
+        </div>
+      </div>
+
+      {/* Inline search results — rendered in document flow, no overflow clipping */}
+      {searchResults.length > 0 && !selectedProduct && (
+        <div style={resultsListStyle}>
+          <div style={{ fontSize: "11px", color: "#6d7175", fontWeight: "600", textTransform: "uppercase", letterSpacing: "0.4px", padding: "8px 14px 4px", borderBottom: "1px solid #f1f2f3" }}>
+            {searchResults.length} product{searchResults.length !== 1 ? "s" : ""} found — click to select
+          </div>
+          {searchResults.map((p) => (
+            <div
+              key={p.id}
+              onClick={() => pickProduct(p)}
+              style={dropItemBase}
+              onMouseEnter={(e) => (e.currentTarget.style.background = "#f3f4f6")}
+              onMouseLeave={(e) => (e.currentTarget.style.background = "#fff")}
+            >
+              {p.featuredImage
+                ? <img src={p.featuredImage.url} alt="" style={dropThumb} />
+                : <div style={{ ...dropThumb, background: "#f1f2f3", display: "flex", alignItems: "center", justifyContent: "center" }}>📦</div>
+              }
+              <div>
+                <div style={{ fontSize: "13px", fontWeight: "500", color: "#303030" }}>{p.title}</div>
+                <div style={{ fontSize: "11px", color: "#8c9196" }}>{p.variants?.nodes?.length ?? 0} variants available</div>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Variant selector */}
+      {selectedProduct && (
+        <div>
+          <label style={labelStyle}>Select default / fallback variant</label>
+          <select
+            value={selectedVariant?.id ?? ""}
+            onChange={(e) => {
+              const v = selectedProduct.variants.nodes.find((x) => x.id === e.target.value);
+              setSelectedVariant(v ?? null);
+            }}
+            style={selectStyle}
+          >
+            {selectedProduct.variants.nodes.map((v) => (
+              <option key={v.id} value={v.id}>{v.title} — ${v.price}</option>
+            ))}
+          </select>
+          <div style={{ fontSize: "12px", color: "#6d7175", marginTop: "5px" }}>
+            Used when subscription variants don't match (Case 1 fallback)
+          </div>
+        </div>
+      )}
+
+      {/* Selected product preview + Add button */}
+      {selectedProduct && selectedVariant && (
+        <div style={selectedPreview}>
+          <div style={{ display: "flex", alignItems: "center", gap: "12px", flex: 1 }}>
+            {selectedProduct.featuredImage
+              ? <img src={selectedProduct.featuredImage.url} alt="" style={previewThumb} />
+              : <div style={{ ...previewThumb, background: "#f1f2f3", display: "flex", alignItems: "center", justifyContent: "center" }}>📦</div>
+            }
+            <div>
+              <div style={{ fontSize: "14px", fontWeight: "600", color: "#303030" }}>{selectedProduct.title}</div>
+              <div style={{ fontSize: "12px", color: "#6d7175", marginTop: "2px" }}>
+                Variant: <strong>{selectedVariant.title}</strong> · <strong>${selectedVariant.price}</strong>
+              </div>
+            </div>
+          </div>
+          <div style={{ display: "flex", gap: "8px", flexShrink: 0 }}>
+            <button
+              type="button"
+              onClick={handleAdd}
+              disabled={isAdding}
+              style={isAdding ? { ...addBtn, opacity: 0.7 } : addBtn}
+            >
+              {isAdding ? "Adding…" : "+ Add to Rotation"}
+            </button>
+            <button
+              type="button"
+              onClick={() => { setSelectedProduct(null); setSelectedVariant(null); setQuery(""); }}
+              style={smallSecBtn}
+            >
+              Clear
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function InfoRow({ label, value }) {
+  return (
+    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: "13px", gap: "12px" }}>
+      <span style={{ color: "#6d7175", fontWeight: "500", flexShrink: 0 }}>{label}</span>
+      <span style={{ color: "#303030", textAlign: "right" }}>{value}</span>
+    </div>
+  );
+}
+
+// ─── Styles ───────────────────────────────────────────────────────────────────
+
+const primaryBtn   = { background: "#303030", color: "#fff", border: "none", borderRadius: "8px", padding: "9px 18px", fontSize: "13px", fontWeight: "500", cursor: "pointer", fontFamily: "inherit" };
+const criticalBtn  = { background: "#fff", color: "#d82c0d", border: "1px solid #f5c6c2", borderRadius: "8px", padding: "8px 18px", fontSize: "13px", fontWeight: "500", cursor: "pointer", fontFamily: "inherit" };
+const smallSecBtn  = { background: "#fff", color: "#303030", border: "1px solid #c9cccf", borderRadius: "6px", padding: "5px 10px", fontSize: "12px", fontWeight: "500", cursor: "pointer", fontFamily: "inherit" };
+const smallCritBtn = { background: "#fff", color: "#d82c0d", border: "1px solid #f5c6c2", borderRadius: "6px", padding: "5px 10px", fontSize: "12px", fontWeight: "500", cursor: "pointer", fontFamily: "inherit" };
+const iconBtn      = { background: "#fff", color: "#303030", border: "1px solid #c9cccf", borderRadius: "6px", padding: "5px 7px", fontSize: "12px", cursor: "pointer", fontFamily: "inherit", lineHeight: "1" };
+const addBtn       = { background: "#303030", color: "#fff", border: "none", borderRadius: "6px", padding: "7px 14px", fontSize: "13px", fontWeight: "500", cursor: "pointer", fontFamily: "inherit" };
+
+const toggleContainer = { display: "inline-flex", background: "#f1f2f3", borderRadius: "8px", padding: "3px", gap: "2px" };
+const toggleBtn        = { background: "transparent", color: "#6d7175", border: "none", borderRadius: "6px", padding: "7px 16px", fontSize: "13px", cursor: "pointer", fontWeight: "500", fontFamily: "inherit", transition: "all 0.15s" };
+const toggleActiveGreen = { background: "#008060", color: "#fff" };
+const toggleActiveRed   = { background: "#d82c0d", color: "#fff" };
+
+const tableStyle = { width: "100%", borderCollapse: "collapse", fontSize: "13px" };
+const th = { padding: "10px 14px", textAlign: "left", fontWeight: "600", fontSize: "11px", color: "#6d7175", borderBottom: "2px solid #e1e3e5", background: "#fafafa", textTransform: "uppercase", letterSpacing: "0.5px", whiteSpace: "nowrap" };
+const td = { padding: "12px 14px", verticalAlign: "middle" };
+
+const badgeActive   = { background: "#e3f5e9", color: "#008060", fontSize: "11px", fontWeight: "600", padding: "3px 9px", borderRadius: "12px" };
+const badgeInactive = { background: "#f6f6f7", color: "#6d7175", fontSize: "11px", fontWeight: "600", padding: "3px 9px", borderRadius: "12px" };
+
+const posNumber    = { width: "26px", height: "26px", borderRadius: "50%", background: "#303030", color: "#fff", fontSize: "11px", fontWeight: "700", display: "flex", alignItems: "center", justifyContent: "center" };
+const itemThumb    = { width: "40px", height: "40px", objectFit: "cover", borderRadius: "6px", flexShrink: 0, border: "1px solid #e1e3e5" };
+const emptySequence = { textAlign: "center", padding: "36px 20px", background: "#fafafa", borderRadius: "8px", border: "1px dashed #c9cccf", marginBottom: "24px" };
+
+const labelStyle   = { display: "block", marginBottom: "7px", fontSize: "13px", fontWeight: "600", color: "#303030" };
+const inputStyle   = { width: "100%", padding: "9px 12px", border: "1px solid #c9cccf", borderRadius: "8px", fontSize: "13px", boxSizing: "border-box", fontFamily: "inherit", outline: "none" };
+const selectStyle  = { width: "100%", padding: "9px 12px", border: "1px solid #c9cccf", borderRadius: "8px", fontSize: "13px", fontFamily: "inherit" };
+const resultsListStyle = { border: "1px solid #c9cccf", borderRadius: "8px", overflow: "hidden", background: "#fff" };
+const dropItemBase = { display: "flex", alignItems: "center", gap: "10px", padding: "10px 14px", cursor: "pointer", background: "#fff", borderBottom: "1px solid #f1f2f3", transition: "background 0.1s" };
+const dropThumb    = { width: "40px", height: "40px", objectFit: "cover", borderRadius: "6px", flexShrink: 0, border: "1px solid #e1e3e5" };
+
+const selectedPreview = { display: "flex", alignItems: "center", justifyContent: "space-between", gap: "16px", padding: "16px", background: "#f6f6f7", border: "1px solid #e1e3e5", borderRadius: "8px", flexWrap: "wrap" };
+const previewThumb = { width: "48px", height: "48px", objectFit: "cover", borderRadius: "6px", border: "1px solid #e1e3e5", flexShrink: 0 };
+
+const successBanner = { background: "#e3f5e9", color: "#008060", border: "1px solid #b3dfcc", borderRadius: "8px", padding: "10px 14px", fontSize: "13px", marginBottom: "16px" };
+const codeStyle = { fontSize: "11px", background: "#f6f6f7", padding: "2px 6px", borderRadius: "4px", fontFamily: "monospace", wordBreak: "break-all" };
+
+export const headers = (headersArgs) => boundary.headers(headersArgs);
