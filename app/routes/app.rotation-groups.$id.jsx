@@ -14,7 +14,10 @@ export const loader = async ({ request, params }) => {
 
   const group = await db.rotationGroup.findFirst({
     where: { id: params.id, shop },
-    include: { rotationItems: { orderBy: { sortOrder: "asc" } } },
+    include: {
+      rotationItems: { orderBy: { sortOrder: "asc" } },
+      instances: { orderBy: { createdAt: "desc" }, take: 50 },
+    },
   });
 
   if (!group) throw new Response("Not Found", { status: 404 });
@@ -45,6 +48,11 @@ export const loader = async ({ request, params }) => {
         ...i,
         createdAt: i.createdAt.toISOString(),
         updatedAt: i.updatedAt.toISOString(),
+      })),
+      instances: group.instances.map((inst) => ({
+        ...inst,
+        createdAt: inst.createdAt.toISOString(),
+        updatedAt: inst.updatedAt.toISOString(),
       })),
     },
     searchProducts,
@@ -107,6 +115,28 @@ export const action = async ({ request, params }) => {
     return null;
   }
 
+  if (intent === "cancelInstance") {
+    const instanceId = fd.get("instanceId")?.toString();
+    if (instanceId) {
+      await db.subscriptionInstance.updateMany({
+        where: { id: instanceId, shop },
+        data: { status: "CANCELLED" },
+      });
+    }
+    return null;
+  }
+
+  if (intent === "reactivateInstance") {
+    const instanceId = fd.get("instanceId")?.toString();
+    if (instanceId) {
+      await db.subscriptionInstance.updateMany({
+        where: { id: instanceId, shop },
+        data: { status: "ACTIVE" },
+      });
+    }
+    return null;
+  }
+
   if (intent === "moveItem") {
     const itemId = fd.get("itemId");
     const dir = fd.get("direction");
@@ -134,6 +164,7 @@ export default function RotationGroupDetail() {
 
       <GroupSettingsSection group={group} />
       <RotationSequenceSection group={group} />
+      <SubscriptionInstancesSection instances={group.instances} />
 
       {/* ── Aside ─────────────────────────────────────────────────────────── */}
       <s-section slot="aside" heading="Rotation Logic">
@@ -335,6 +366,104 @@ function RotationItemRow({ item, idx, isFirst, isLast }) {
             title="Remove from rotation"
           >Remove</button>
         </div>
+      </td>
+    </tr>
+  );
+}
+
+// ─── Subscription Instances Section ──────────────────────────────────────────
+
+function SubscriptionInstancesSection({ instances }) {
+  const active    = instances.filter((i) => i.status === "ACTIVE").length;
+  const cancelled = instances.filter((i) => i.status === "CANCELLED").length;
+
+  return (
+    <s-section heading={`Subscription Instances (${instances.length})`}>
+      <div style={{ fontSize: "13px", color: "#6d7175", marginBottom: "16px", lineHeight: "1.5" }}>
+        Each row is one customer subscription tracked by this app. Cancel an instance manually if the customer
+        cancelled their subscription in your subscription app (e.g. Loop) — the Active Subscriptions count
+        on the dashboard will update immediately.
+      </div>
+
+      {/* Summary pills */}
+      <div style={{ display: "flex", gap: "8px", marginBottom: "16px", flexWrap: "wrap" }}>
+        <span style={pillGreen}>{active} Active</span>
+        <span style={pillGrey}>{cancelled} Cancelled</span>
+      </div>
+
+      {instances.length === 0 ? (
+        <div style={{ textAlign: "center", padding: "28px 20px", background: "#fafafa", borderRadius: "8px", border: "1px dashed #c9cccf" }}>
+          <div style={{ fontSize: "13px", color: "#6d7175" }}>No subscription instances yet — they are created automatically when renewal orders arrive.</div>
+        </div>
+      ) : (
+        <div style={{ border: "1px solid #e1e3e5", borderRadius: "8px" }}>
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ ...tableStyle, minWidth: "580px" }}>
+              <thead>
+                <tr>
+                  <th style={th}>Customer ID</th>
+                  <th style={th}>Order ID</th>
+                  <th style={th}>Rotation #</th>
+                  <th style={th}>Status</th>
+                  <th style={th}>Since</th>
+                  <th style={th}>Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                {instances.map((inst) => (
+                  <InstanceRow key={inst.id} inst={inst} />
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+    </s-section>
+  );
+}
+
+function InstanceRow({ inst }) {
+  const fetcher = useFetcher();
+  const isBusy  = fetcher.state !== "idle";
+  const status  = fetcher.formData?.get("intent") === "cancelInstance"     ? "CANCELLED"
+                : fetcher.formData?.get("intent") === "reactivateInstance" ? "ACTIVE"
+                : inst.status;
+
+  return (
+    <tr style={{ borderBottom: "1px solid #f1f2f3", opacity: isBusy ? 0.6 : 1 }}>
+      <td style={td}><code style={codeStyle}>{inst.customerId}</code></td>
+      <td style={td}><code style={codeStyle}>#{inst.originalOrderId}</code></td>
+      <td style={{ ...td, textAlign: "center" }}>
+        <div style={{ width: "26px", height: "26px", borderRadius: "50%", background: "#303030", color: "#fff", fontSize: "11px", fontWeight: "700", display: "flex", alignItems: "center", justifyContent: "center" }}>
+          {inst.currentIndex + 1}
+        </div>
+      </td>
+      <td style={td}>
+        <span style={status === "ACTIVE" ? badgeActive : badgeInactive}>{status}</span>
+      </td>
+      <td style={td}>
+        <span style={{ fontSize: "12px", color: "#6d7175" }}>{new Date(inst.createdAt).toLocaleDateString()}</span>
+      </td>
+      <td style={{ ...td, whiteSpace: "nowrap" }}>
+        {status === "ACTIVE" ? (
+          <button
+            type="button"
+            disabled={isBusy}
+            onClick={() => fetcher.submit({ intent: "cancelInstance", instanceId: inst.id }, { method: "post" })}
+            style={smallCritBtn}
+          >
+            Cancel
+          </button>
+        ) : (
+          <button
+            type="button"
+            disabled={isBusy}
+            onClick={() => fetcher.submit({ intent: "reactivateInstance", instanceId: inst.id }, { method: "post" })}
+            style={smallSecBtn}
+          >
+            Reactivate
+          </button>
+        )}
       </td>
     </tr>
   );
@@ -543,5 +672,7 @@ const previewThumb = { width: "48px", height: "48px", objectFit: "cover", border
 
 const successBanner = { background: "#e3f5e9", color: "#008060", border: "1px solid #b3dfcc", borderRadius: "8px", padding: "10px 14px", fontSize: "13px", marginBottom: "16px" };
 const codeStyle = { fontSize: "11px", background: "#f6f6f7", padding: "2px 6px", borderRadius: "4px", fontFamily: "monospace", wordBreak: "break-all" };
+const pillGreen = { background: "#e3f5e9", color: "#008060", fontSize: "12px", fontWeight: "600", padding: "4px 12px", borderRadius: "12px" };
+const pillGrey  = { background: "#f6f6f7", color: "#6d7175", fontSize: "12px", fontWeight: "600", padding: "4px 12px", borderRadius: "12px" };
 
 export const headers = (headersArgs) => boundary.headers(headersArgs);

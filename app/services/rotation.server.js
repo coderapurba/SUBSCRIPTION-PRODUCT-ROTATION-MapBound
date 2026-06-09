@@ -162,67 +162,79 @@ async function writeLog(shop, orderId, instance, rotationItem, group, status, er
  * @param {object} admin  - Shopify Admin GraphQL client (from unauthenticated.admin)
  */
 export async function processOrderWebhook(shop, order, admin) {
-  // Ensure ShopSetting row exists (upsert is safe across concurrent requests)
-  await db.shopSetting.upsert({
-    where: { shop },
-    create: { shop },
-    update: {},
-  });
+  await db.shopSetting.upsert({ where: { shop }, create: { shop }, update: {} });
 
-  const isRenewal = order.source_name === "subscription";
   const customerId = String(order.customer?.id ?? "anonymous");
-  const orderId = String(order.id);
-  const orderGid = `gid://shopify/Order/${orderId}`;
+  const orderId    = String(order.id);
+  const orderGid   = `gid://shopify/Order/${orderId}`;
   const contractId = extractContractId(order);
-  const currency = order.currency ?? "USD";
+  const currency   = order.currency ?? "USD";
 
-  // Load all active rotation groups for this shop (with their active, ordered items)
+  // source_name is "subscription" for native Shopify subscription billing.
+  // Loop and other apps may use different values, so we also check by existing instance below.
+  const sourceIsSubscription = order.source_name === "subscription";
+
+  console.log(`[rotation] order=${orderId} source_name=${order.source_name} customer=${customerId} contractId=${contractId ?? "none"}`);
+
   const groups = await db.rotationGroup.findMany({
     where: { shop, isActive: true },
     include: {
-      rotationItems: {
-        where: { isActive: true },
-        orderBy: { sortOrder: "asc" },
-      },
+      rotationItems: { where: { isActive: true }, orderBy: { sortOrder: "asc" } },
     },
   });
 
-  if (groups.length === 0) return;
+  if (groups.length === 0) {
+    console.log(`[rotation] no active groups for shop=${shop}, skipping`);
+    return;
+  }
 
   for (const group of groups) {
     const targetNumericId = toNumericId(group.targetProductId);
 
-    // All line items in this order that belong to the target product
     const targetLineItems = (order.line_items ?? []).filter(
       (li) => String(li.product_id) === targetNumericId
     );
 
     if (targetLineItems.length === 0) continue;
 
-    if (!isRenewal) {
-      // ── First / new order ──────────────────────────────────────────────────
-      await createSubscriptionInstance(
-        shop, orderId, customerId, contractId, group, targetLineItems
-      );
-      // Do NOT rotate — keep original product on first order
-    } else {
-      // ── Renewal order ──────────────────────────────────────────────────────
-      const instance = await findRenewalInstance(
-        shop, customerId, group.targetProductId, contractId
-      );
+    console.log(`[rotation] order=${orderId} matched group=${group.id} product=${group.targetProductId} lineItems=${targetLineItems.length}`);
 
-      if (!instance) {
-        // Edge case: renewal arrived before first order was processed
-        console.warn(
-          `[rotation] Renewal for unknown instance — shop=${shop} order=${orderId} product=${group.targetProductId}. Creating new instance.`
-        );
-        await createSubscriptionInstance(
-          shop, orderId, customerId, contractId, group, targetLineItems
-        );
+    // Look for an existing active instance for this customer + product.
+    // If one exists, this order is a renewal — rotate regardless of source_name.
+    // This makes rotation work with Loop, ReCharge, Bold, and other subscription apps
+    // that may not set source_name="subscription".
+    const existingInstance = await findRenewalInstance(
+      shop, customerId, group.targetProductId, contractId
+    );
+
+    const isRenewal = sourceIsSubscription || existingInstance !== null;
+
+    console.log(`[rotation] order=${orderId} sourceIsSubscription=${sourceIsSubscription} existingInstance=${existingInstance?.id ?? "none"} isRenewal=${isRenewal}`);
+
+    if (!isRenewal) {
+      // ── Genuinely first order — create instance, do NOT rotate ────────────
+      await createSubscriptionInstance(shop, orderId, customerId, contractId, group, targetLineItems);
+      console.log(`[rotation] order=${orderId} → first order, instance created, no rotation`);
+    } else if (!existingInstance) {
+      // ── source_name says renewal but no prior instance found ───────────────
+      // Create instance now; next renewal will rotate.
+      console.warn(`[rotation] order=${orderId} → renewal but no prior instance, creating instance`);
+      await createSubscriptionInstance(shop, orderId, customerId, contractId, group, targetLineItems);
+    } else {
+      // ── Renewal with existing instance — rotate ────────────────────────────
+
+      // Idempotency guard: skip if we already processed this exact order for this instance
+      // (webhook can fire twice — duplicate delivery or Loop's two-phase order creation)
+      const alreadyLogged = await db.rotationLog.findFirst({
+        where: { shop, orderId: orderGid, subscriptionInstanceId: existingInstance.id },
+      });
+      if (alreadyLogged) {
+        console.log(`[rotation] order=${orderId} already processed (log id=${alreadyLogged.id}), skipping duplicate`);
         continue;
       }
 
-      await rotateOrderItems(shop, orderGid, instance, group, targetLineItems, currency, admin);
+      console.log(`[rotation] order=${orderId} → renewal, rotating instance=${existingInstance.id} index=${existingInstance.currentIndex}`);
+      await rotateOrderItems(shop, orderGid, existingInstance, group, targetLineItems, currency, admin);
     }
   }
 }

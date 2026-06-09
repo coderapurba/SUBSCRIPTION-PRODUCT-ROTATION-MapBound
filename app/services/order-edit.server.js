@@ -2,11 +2,9 @@
  * Shopify Admin GraphQL order-edit service.
  *
  * Flow:
- *   beginOrderEdit → setQuantity(target, 0) → addVariant(rotation) →
- *   addDiscount(if needed) → commitOrderEdit
+ *   beginOrderEdit → query calculatedLineItems → setQuantity(target, 0) →
+ *   addVariant(rotation) → addDiscount(if needed) → commitOrderEdit
  */
-
-// ─── GraphQL helpers ──────────────────────────────────────────────────────────
 
 async function gql(admin, query, variables = {}) {
   const res = await admin.graphql(query, { variables });
@@ -26,11 +24,28 @@ async function getProductVariants(admin, productId) {
   return data?.data?.product?.variants?.nodes ?? [];
 }
 
+/**
+ * Begin an order edit and return the calculatedOrder ID along with
+ * all calculated line items (each has a CalculatedLineItem.id needed
+ * for setQuantity/addDiscount mutations).
+ */
 async function beginOrderEdit(admin, orderId) {
   const data = await gql(admin, `
     mutation OrderEditBegin($id: ID!) {
       orderEditBegin(id: $id) {
-        calculatedOrder { id }
+        calculatedOrder {
+          id
+          lineItems(first: 50) {
+            nodes {
+              id
+              quantity
+              variant {
+                id
+                product { id }
+              }
+            }
+          }
+        }
         userErrors { field message }
       }
     }
@@ -38,17 +53,22 @@ async function beginOrderEdit(admin, orderId) {
 
   const errors = data?.data?.orderEditBegin?.userErrors;
   if (errors?.length) throw new Error(`orderEditBegin: ${errors[0].message}`);
-  return data.data.orderEditBegin.calculatedOrder.id;
+
+  const calcOrder = data.data.orderEditBegin.calculatedOrder;
+  return {
+    calcOrderId: calcOrder.id,
+    calcLineItems: calcOrder.lineItems?.nodes ?? [],
+  };
 }
 
-async function setLineItemQuantity(admin, calcOrderId, lineItemId, quantity) {
+async function setLineItemQuantity(admin, calcOrderId, calcLineItemId, quantity) {
   const data = await gql(admin, `
     mutation OrderEditSetQuantity($id: ID!, $lineItemId: ID!, $quantity: Int!) {
       orderEditSetQuantity(id: $id, lineItemId: $lineItemId, quantity: $quantity) {
         userErrors { field message }
       }
     }
-  `, { id: calcOrderId, lineItemId, quantity });
+  `, { id: calcOrderId, lineItemId: calcLineItemId, quantity });
 
   const errors = data?.data?.orderEditSetQuantity?.userErrors;
   if (errors?.length) throw new Error(`orderEditSetQuantity: ${errors[0].message}`);
@@ -88,7 +108,6 @@ async function addFixedDiscount(admin, calcOrderId, lineItemId, amount, currency
 
   const errors = data?.data?.orderEditAddLineItemDiscount?.userErrors;
   if (errors?.length) {
-    // Non-fatal: log and continue — price mismatch is acceptable
     console.warn(`[order-edit] addDiscount warning: ${errors[0].message}`);
   }
 }
@@ -113,12 +132,12 @@ async function commitOrderEdit(admin, calcOrderId) {
  * Swap target subscription line items with the next rotation product.
  *
  * @param {object} opts
- * @param {object} opts.admin           - Shopify Admin GraphQL client
- * @param {string} opts.orderGid        - gid://shopify/Order/...
- * @param {object[]} opts.targetLineItems - Raw webhook line item objects for the target product
- * @param {object} opts.nextItem        - RotationItem from DB
- * @param {any} opts.lineItemSnapshot   - JSON snapshot stored on first order
- * @param {string} opts.currency        - ISO currency code from order (e.g. "USD")
+ * @param {object} opts.admin             - Shopify Admin GraphQL client
+ * @param {string} opts.orderGid          - gid://shopify/Order/...
+ * @param {object[]} opts.targetLineItems - Webhook line item objects for the target product
+ * @param {object} opts.nextItem          - RotationItem from DB
+ * @param {any} opts.lineItemSnapshot     - JSON snapshot stored on first order
+ * @param {string} opts.currency          - ISO currency code
  */
 export async function performOrderEdit({ admin, orderGid, targetLineItems, nextItem, lineItemSnapshot, currency }) {
   const snapshot = Array.isArray(lineItemSnapshot) ? lineItemSnapshot : [];
@@ -132,17 +151,35 @@ export async function performOrderEdit({ admin, orderGid, targetLineItems, nextI
     targetTitles.length > 0 &&
     targetTitles.every((t) => nextVariantTitleMap.has(t));
 
-  // ── 2. Begin edit ───────────────────────────────────────────────────────────
-  const calcOrderId = await beginOrderEdit(admin, orderGid);
+  console.log(`[order-edit] order=${orderGid} case=${allTitlesMatch ? "2 (variant match)" : "1 (default variant)"} snapshotItems=${snapshot.length} targetLineItems=${targetLineItems.length}`);
 
-  // ── 3. Zero-out target line items ───────────────────────────────────────────
+  // ── 2. Begin edit — returns calcOrderId + CalculatedLineItem list ───────────
+  const { calcOrderId, calcLineItems } = await beginOrderEdit(admin, orderGid);
+
+  console.log(`[order-edit] calcOrderId=${calcOrderId} calcLineItems=${calcLineItems.length}`);
+
+  // Build a map: numeric product id → CalculatedLineItem id
+  // (CalculatedLineItem IDs are required for setQuantity/addDiscount)
+  const calcLineItemByProductId = new Map();
+  for (const cli of calcLineItems) {
+    const numericProductId = cli.variant?.product?.id?.split("/").pop();
+    if (numericProductId) {
+      calcLineItemByProductId.set(numericProductId, cli.id);
+    }
+  }
+
+  // ── 3. Zero-out target line items using CalculatedLineItem IDs ──────────────
   for (const li of targetLineItems) {
-    await setLineItemQuantity(
-      admin,
-      calcOrderId,
-      `gid://shopify/LineItem/${li.id}`,
-      0
-    );
+    const numericProductId = String(li.product_id);
+    const calcLineItemId = calcLineItemByProductId.get(numericProductId);
+
+    if (!calcLineItemId) {
+      console.warn(`[order-edit] no CalculatedLineItem found for product_id=${numericProductId}, skipping`);
+      continue;
+    }
+
+    console.log(`[order-edit] zeroing product_id=${numericProductId} calcLineItemId=${calcLineItemId}`);
+    await setLineItemQuantity(admin, calcOrderId, calcLineItemId, 0);
   }
 
   // ── 4. Add rotation items ───────────────────────────────────────────────────
@@ -153,13 +190,12 @@ export async function performOrderEdit({ admin, orderGid, targetLineItems, nextI
       if (!match) continue;
 
       const addedLineItemId = await addVariant(admin, calcOrderId, match.id, snap.quantity);
-
       const listedTotal = parseFloat(match.price) * snap.quantity;
       const targetTotal = parseFloat(snap.finalLinePrice);
       await addFixedDiscount(admin, calcOrderId, addedLineItemId, listedTotal - targetTotal, currency);
     }
   } else {
-    // Case 1: use the stored default variant; combine total qty + price
+    // Case 1: use stored default variant; combine total qty + price
     const totalQty =
       snapshot.reduce((s, x) => s + (x.quantity || 1), 0) ||
       targetLineItems.reduce((s, li) => s + li.quantity, 0);
@@ -172,11 +208,11 @@ export async function performOrderEdit({ admin, orderGid, targetLineItems, nextI
       );
 
     const addedLineItemId = await addVariant(admin, calcOrderId, nextItem.variantId, totalQty);
-
     const listedTotal = parseFloat(nextItem.price || "0") * totalQty;
     await addFixedDiscount(admin, calcOrderId, addedLineItemId, listedTotal - totalPrice, currency);
   }
 
   // ── 5. Commit ───────────────────────────────────────────────────────────────
   await commitOrderEdit(admin, calcOrderId);
+  console.log(`[order-edit] committed successfully for order=${orderGid}`);
 }
