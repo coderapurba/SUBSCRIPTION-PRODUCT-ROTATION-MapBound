@@ -1,0 +1,100 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:dev.sqlite"
+}
+
+model Session {
+  id            String    @id
+  shop          String
+  state         String
+  isOnline      Boolean   @default(false)
+  scope         String?
+  expires       DateTime?
+  accessToken   String
+  userId        BigInt?
+  firstName     String?
+  lastName      String?
+  email         String?
+  accountOwner  Boolean   @default(false)
+  locale        String?
+  collaborator  Boolean?  @default(false)
+  emailVerified Boolean?  @default(false)
+  refreshToken        String?
+  refreshTokenExpires DateTime?
+}
+
+model RotationGroup {
+  id          String   @id @default(cuid())
+  shop        String
+  name        String
+  description String?
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  items     RotationItem[]
+  instances SubscriptionInstance[]
+
+  @@index([shop])
+}
+
+model RotationItem {
+  id              String   @id @default(cuid())
+  rotationGroupId String
+  productId       String
+  variantId       String?
+  productTitle    String
+  variantTitle    String?
+  position        Int
+  imageUrl        String?
+  price           String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  rotationGroup RotationGroup @relation(fields: [rotationGroupId], references: [id], onDelete: Cascade)
+
+  @@index([rotationGroupId])
+}
+
+model SubscriptionInstance {
+  id                     String    @id @default(cuid())
+  shop                   String
+  subscriptionContractId String
+  rotationGroupId        String
+  currentPosition        Int       @default(0)
+  status                 String    @default("ACTIVE")
+  nextRotationDate       DateTime?
+  lastRotatedAt          DateTime?
+  createdAt              DateTime  @default(now())
+  updatedAt              DateTime  @updatedAt
+
+  rotationGroup RotationGroup @relation(fields: [rotationGroupId], references: [id])
+  rotationLogs  RotationLog[]
+
+  @@unique([shop, subscriptionContractId])
+  @@index([shop])
+  @@index([rotationGroupId])
+}
+
+model RotationLog {
+  id                     String   @id @default(cuid())
+  shop                   String
+  subscriptionInstanceId String
+  fromProductId          String?
+  fromProductTitle       String?
+  toProductId            String
+  toProductTitle         String
+  rotatedAt              DateTime @default(now())
+  status                 String   @default("SUCCESS")
+  errorMessage           String?
+  triggeredBy            String   @default("SCHEDULED")
+
+  subscriptionInstance SubscriptionInstance @relation(fields: [subscriptionInstanceId], references: [id], onDelete: Cascade)
+
+  @@index([shop])
+  @@index([subscriptionInstanceId])
+}
