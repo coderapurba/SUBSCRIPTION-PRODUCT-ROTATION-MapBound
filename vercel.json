@@ -1,8 +1,4 @@
 {
   "buildCommand": "npm run vercel-build",
-  "outputDirectory": "build/client",
-  "framework": null,
-  "rewrites": [
-    { "source": "/(.*)", "destination": "/build/server/index.js" }
-  ]
+  "framework": null
 }
