@@ -1,50 +1,83 @@
 import { authenticate } from "../shopify.server";
 import db from "../db.server";
 
-const STATUS_MAP = {
-  ACTIVE: "ACTIVE",
-  PAUSED: "PAUSED",
-  CANCELLED: "CANCELLED",
-  EXPIRED: "CANCELLED",
-  FAILED: "CANCELLED",
-};
+const TERMINAL_STATUSES = ["CANCELLED", "EXPIRED", "FAILED"];
 
 export const action = async ({ request }) => {
   const { shop, topic, payload } = await authenticate.webhook(request);
 
-  console.log(`[webhook] ${topic} for ${shop} — status: ${payload?.status}`);
+  // ── Debug logging ─────────────────────────────────────────────────────────
+  console.log("🔥 SUBSCRIPTION CONTRACT UPDATE WEBHOOK HIT");
+  console.log("shop:", shop);
+  console.log("topic:", topic);
+  console.log("payload.status:", payload?.status);
+  console.log("payload.admin_graphql_api_id:", payload?.admin_graphql_api_id);
+  console.log("full payload:", JSON.stringify(payload, null, 2));
 
   const contractId = payload?.admin_graphql_api_id;
-  const newStatus = payload?.status;
+  const status     = payload?.status;
   const customerId = payload?.customer_id ? String(payload.customer_id) : null;
 
-  if (!newStatus) return new Response(null, { status: 200 });
-
-  const mappedStatus = STATUS_MAP[newStatus];
-  if (!mappedStatus) return new Response(null, { status: 200 });
-
-  // Primary: update by contractId
-  if (contractId) {
-    const { count } = await db.subscriptionInstance.updateMany({
-      where: { shop, subscriptionContractId: contractId },
-      data: { status: mappedStatus },
-    });
-    console.log(`[webhook] ${topic} — updated ${count} instances by contractId`);
-    if (count > 0) return new Response(null, { status: 200 });
+  // Only act on terminal statuses
+  if (!status || !TERMINAL_STATUSES.includes(status)) {
+    console.log(`[webhook] ${topic} — status=${status ?? "none"} is not terminal, skipping`);
+    return Response.json({ success: true, topic, contractId, status, updatedCount: 0 });
   }
 
-  // Fallback: use customer_id from payload directly
-  // Only for non-ACTIVE transitions (don't accidentally activate all instances)
-  if (customerId && mappedStatus !== "ACTIVE") {
-    const { count } = await db.subscriptionInstance.updateMany({
-      where: { shop, customerId, status: "ACTIVE" },
+  let updatedCount = 0;
+  let logStatus    = "FAILED";
+  let logMessage   = "";
+
+  try {
+    // Primary: update by contractId
+    if (contractId) {
+      const { count } = await db.subscriptionInstance.updateMany({
+        where: { shop, subscriptionContractId: contractId },
+        data: { status: "CANCELLED" },
+      });
+      updatedCount = count;
+      console.log(`[webhook] ${topic} — updated ${count} instance(s) by contractId=${contractId} → CANCELLED`);
+    }
+
+    // Fallback: match by customerId if contractId found nothing
+    if (updatedCount === 0 && customerId) {
+      console.warn(`[webhook] ${topic} — no instance found by contractId=${contractId ?? "none"}, trying customerId=${customerId} fallback`);
+
+      const { count } = await db.subscriptionInstance.updateMany({
+        where: { shop, customerId, status: "ACTIVE" },
+        data: {
+          status: "CANCELLED",
+          ...(contractId ? { subscriptionContractId: contractId } : {}),
+        },
+      });
+      updatedCount = count;
+      console.log(`[webhook] ${topic} — updated ${count} instance(s) by customerId fallback → CANCELLED`);
+    }
+
+    if (updatedCount === 0) {
+      console.warn(`[webhook] ${topic} — no matching SubscriptionInstance found for contractId=${contractId ?? "none"} customer=${customerId ?? "none"}`);
+      logStatus  = "FAILED";
+      logMessage = `No matching SubscriptionInstance found. contractId=${contractId ?? "none"} status=${status}`;
+    } else {
+      logStatus  = "SUCCESS";
+      logMessage = `${updatedCount} instance(s) set to CANCELLED. contractId=${contractId ?? "none"} status=${status}`;
+    }
+
+    // Write rotation log
+    await db.rotationLog.create({
       data: {
-        status: mappedStatus,
-        ...(contractId ? { subscriptionContractId: contractId } : {}),
+        shop,
+        orderId:              `subscription_contracts_update:${contractId ?? customerId ?? "unknown"}`,
+        customerId:           customerId ?? "unknown",
+        targetProductTitle:   "subscription_contracts_update_webhook",
+        rotationProductTitle: "",
+        status:               logStatus,
+        message:              logMessage,
       },
     });
-    console.log(`[webhook] ${topic} — updated ${count} instances by customerId fallback`);
+  } catch (err) {
+    console.error(`[webhook] ${topic} error for ${shop}:`, err.message);
   }
 
-  return new Response(null, { status: 200 });
+  return Response.json({ success: true, topic, contractId, status, updatedCount });
 };
