@@ -84,6 +84,7 @@ model SubscriptionInstance {
   targetProductId        String
   currentIndex           Int      @default(0)
   uniqueKey              String   @unique
+  lineItemFingerprint    String?
   status                 String   @default("ACTIVE")
   rotationGroupId        String
   createdAt              DateTime @default(now())

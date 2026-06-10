@@ -3,8 +3,8 @@
  *
  * Entry point: processOrderWebhook(shop, order, admin)
  *
- * First order  → create SubscriptionInstance (no JSON blobs, lean fields only)
- * Renewal order → find instance by contractId or customerId+product → rotate → prune logs
+ * First order  → create SubscriptionInstance with line item fingerprint
+ * Renewal order → find instance by contractId → fingerprint → recency fallback → rotate → prune logs
  */
 
 import db from "../db.server.js";
@@ -18,6 +18,16 @@ function toNumericId(gid) {
 
 function buildUniqueKey(shop, customerId, targetProductId, orderId) {
   return `${shop}:${customerId}:${toNumericId(targetProductId)}:${orderId}`;
+}
+
+// Fingerprint = sorted "variantId:qty,..." for the target product line items.
+// Loop preserves the same variants + quantities in renewal orders as in the original purchase,
+// so this reliably identifies which subscription a renewal belongs to.
+function buildLineItemFingerprint(lineItems) {
+  return lineItems
+    .map((li) => `${li.variant_id}:${li.quantity}`)
+    .sort()
+    .join(",");
 }
 
 function extractContractId(order) {
@@ -35,8 +45,9 @@ function extractContractId(order) {
 
 // ─── Instance helpers ─────────────────────────────────────────────────────────
 
-async function createSubscriptionInstance(shop, orderId, customerId, contractId, group) {
+async function createSubscriptionInstance(shop, orderId, customerId, contractId, group, targetLineItems) {
   const uniqueKey = buildUniqueKey(shop, customerId, group.targetProductId, orderId);
+  const fingerprint = buildLineItemFingerprint(targetLineItems);
 
   const existing = await db.subscriptionInstance.findUnique({ where: { uniqueKey } });
   if (existing) return existing;
@@ -50,41 +61,74 @@ async function createSubscriptionInstance(shop, orderId, customerId, contractId,
       targetProductId: group.targetProductId,
       currentIndex: 0,
       uniqueKey,
+      lineItemFingerprint: fingerprint,
       status: "ACTIVE",
       rotationGroupId: group.id,
     },
   });
 }
 
-async function findRenewalInstance(shop, customerId, targetProductId, contractId) {
-  // Primary: exact match by contract ID (most reliable — each Loop subscription has a unique contract)
+async function findRenewalInstance(shop, customerId, targetProductId, contractId, renewalLineItems) {
+  // Primary: exact match by contract ID
   if (contractId) {
     const inst = await db.subscriptionInstance.findFirst({
       where: { shop, subscriptionContractId: contractId, targetProductId, status: "ACTIVE" },
     });
     if (inst) return inst;
-    // Contract ID present but no instance found — log so we can investigate
-    console.warn(`[rotation] No ACTIVE instance found for contractId=${contractId} (${targetProductId}). Falling back to recency lookup.`);
+    console.warn(`[rotation] No ACTIVE instance for contractId=${contractId}. Falling back to fingerprint lookup.`);
   }
 
-  // Fallback: newest active instance for this customer+product.
-  // This handles the rare case where Loop doesn't include the contract ID in the renewal order.
-  // With multiple concurrent subscriptions, the most recently created instance is selected;
-  // the others will be matched correctly when their own contract ID is present.
+  const renewalFingerprint = buildLineItemFingerprint(renewalLineItems);
+
   const instances = await db.subscriptionInstance.findMany({
     where: { shop, customerId, targetProductId, status: "ACTIVE" },
     orderBy: { createdAt: "desc" },
   });
 
-  if (instances.length > 1) {
-    console.warn(
-      `[rotation] customer=${customerId} has ${instances.length} active instances for product=${targetProductId} ` +
-      `and no contractId was found in the order. Using most-recent instance=${instances[0].id}. ` +
-      `Other instances: ${instances.slice(1).map(i => i.id).join(", ")}`
-    );
+  if (instances.length === 0) return null;
+
+  // Single instance: if fingerprint stored and doesn't match, this renewal belongs to a
+  // different subscription (the matching instance hasn't been created yet)
+  if (instances.length === 1) {
+    const inst = instances[0];
+    if (inst.lineItemFingerprint && inst.lineItemFingerprint !== renewalFingerprint) {
+      console.warn(
+        `[rotation] customer=${customerId} single instance=${inst.id} fingerprint mismatch — ` +
+        `renewal fingerprint=${renewalFingerprint} vs stored=${inst.lineItemFingerprint}. ` +
+        `Treating as new subscription.`
+      );
+      return null;
+    }
+    return inst;
   }
 
-  return instances[0] ?? null;
+  // Multiple instances — match by fingerprint
+  const matched = instances.find((i) => i.lineItemFingerprint === renewalFingerprint);
+  if (matched) {
+    console.log(`[rotation] customer=${customerId} matched instance=${matched.id} by fingerprint=${renewalFingerprint}`);
+    return matched;
+  }
+
+  // No fingerprint match — check for legacy instances (null fingerprint)
+  const untagged = instances.filter((i) => !i.lineItemFingerprint);
+  if (untagged.length === 1) {
+    // Exactly one legacy instance: assign this fingerprint to it and use it
+    await db.subscriptionInstance.update({
+      where: { id: untagged[0].id },
+      data: { lineItemFingerprint: renewalFingerprint },
+    });
+    console.log(`[rotation] customer=${customerId} assigned fingerprint to legacy instance=${untagged[0].id}`);
+    return untagged[0];
+  }
+
+  // Multiple untagged instances — cannot reliably distinguish, use most-recent
+  console.warn(
+    `[rotation] customer=${customerId} has ${instances.length} active instances for product=${targetProductId}, ` +
+    `fingerprint=${renewalFingerprint} unmatched (${untagged.length} untagged). ` +
+    `Using most-recent=${instances[0].id}. ` +
+    `Fix: delete stale SubscriptionInstance rows and re-test.`
+  );
+  return instances[0];
 }
 
 // ─── Log helpers ──────────────────────────────────────────────────────────────
@@ -114,7 +158,6 @@ async function pruneOldLogs(shop) {
     where: { shop, createdAt: { lt: cutoff } },
   });
 
-  // Find IDs beyond the 50-row cap (newest first)
   const overflow = await db.rotationLog.findMany({
     where: { shop },
     orderBy: { createdAt: "desc" },
@@ -143,7 +186,6 @@ async function rotateOrderItems(shop, orderGid, instance, group, targetLineItems
   const nextItem  = activeItems[nextIndex];
   const newIndex  = (nextIndex + 1) % activeItems.length;
 
-  // Skip if the rotation item points back at the target product itself (self-rotation)
   if (toNumericId(nextItem.productId) === toNumericId(group.targetProductId)) {
     console.log(`[rotation] order=${orderGid} rotation item at index=${nextIndex} is the target product — skipping self-rotation, advancing index`);
     await db.subscriptionInstance.update({ where: { id: instance.id }, data: { currentIndex: newIndex } });
@@ -152,7 +194,6 @@ async function rotateOrderItems(shop, orderGid, instance, group, targetLineItems
   }
 
   try {
-    // order-edit uses targetLineItems directly — no lineItemSnapshot needed
     await performOrderEdit({ admin, orderGid, targetLineItems, nextItem, currency });
 
     await db.subscriptionInstance.update({
@@ -163,7 +204,6 @@ async function rotateOrderItems(shop, orderGid, instance, group, targetLineItems
     await writeLog(shop, orderGid, instance, nextItem, group, "SUCCESS");
   } catch (err) {
     if (err.concurrent) {
-      // A concurrent webhook run already processed this order — not a failure
       console.log(`[rotation] order=${orderGid} already processed by concurrent webhook, skipping`);
       return;
     }
@@ -183,7 +223,6 @@ export async function processOrderWebhook(shop, order, admin) {
   const contractId = extractContractId(order);
   const currency   = order.currency ?? "USD";
 
-  // Loop renewal orders always use this source_name — anything else is a new purchase
   const sourceIsLoopRenewal = order.source_name === "subscription_contract_checkout_one";
 
   console.log(`[rotation] order=${orderId} source_name=${order.source_name} customer=${customerId} contractId=${contractId ?? "none"}`);
@@ -211,30 +250,26 @@ export async function processOrderWebhook(shop, order, admin) {
     console.log(`[rotation] order=${orderId} matched group=${group.id} product=${group.targetProductId} lineItems=${targetLineItems.length}`);
 
     if (!sourceIsLoopRenewal) {
-      // ── New subscription purchase ──
-      // Create a fresh independent instance for this purchase.
-      // Do NOT cancel other active instances — the customer may hold multiple
-      // concurrent subscriptions for the same product (e.g. different quantities
-      // or variants). Each purchase must track its own rotation index independently.
+      // New subscription purchase — create a fresh independent instance with fingerprint.
+      // Do NOT cancel other active instances — each purchase tracks its own rotation index.
       // Real cancellations are handled by the subscription-contracts/cancel webhook.
-      await createSubscriptionInstance(shop, orderId, customerId, contractId, group);
+      await createSubscriptionInstance(shop, orderId, customerId, contractId, group, targetLineItems);
       console.log(`[rotation] order=${orderId} → new subscription purchase, fresh instance created`);
       continue;
     }
 
     // ── Loop renewal order ────────────────────────────────────────────────────
     const existingInstance = await findRenewalInstance(
-      shop, customerId, group.targetProductId, contractId
+      shop, customerId, group.targetProductId, contractId, targetLineItems
     );
 
     console.log(`[rotation] order=${orderId} sourceIsLoopRenewal=true existingInstance=${existingInstance?.id ?? "none"}`);
 
     if (!existingInstance) {
-      // Renewal arrived before any first-order instance — create one and wait for next
+      // No matching instance — create one for this subscription and wait for next renewal
       console.warn(`[rotation] order=${orderId} → renewal but no prior instance, creating`);
-      await createSubscriptionInstance(shop, orderId, customerId, contractId, group);
+      await createSubscriptionInstance(shop, orderId, customerId, contractId, group, targetLineItems);
     } else {
-      // Idempotency: skip if already processed this order
       const alreadyLogged = await db.rotationLog.findFirst({
         where: { shop, orderId: orderGid, customerId: existingInstance.customerId },
       });
@@ -243,12 +278,11 @@ export async function processOrderWebhook(shop, order, admin) {
         continue;
       }
 
-      console.log(`[rotation] order=${orderId} → renewal, rotating instance=${existingInstance.id} index=${existingInstance.currentIndex}`);
+      console.log(`[rotation] order=${orderId} → renewal, rotating instance=${existingInstance.id} index=${existingInstance.currentIndex} fingerprint=${existingInstance.lineItemFingerprint ?? "none"}`);
       await rotateOrderItems(shop, orderGid, existingInstance, group, targetLineItems, currency, admin);
     }
   }
 
-  // Prune old logs once per webhook run (non-blocking)
   pruneOldLogs(shop).catch((err) =>
     console.error(`[rotation] pruneOldLogs error for ${shop}:`, err.message)
   );
