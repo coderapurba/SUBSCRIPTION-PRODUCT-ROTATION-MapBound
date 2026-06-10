@@ -2,31 +2,27 @@ import { authenticate, unauthenticated } from "../shopify.server";
 import db from "../db.server";
 
 /**
- * When a subscription contract activates, back-fill the subscriptionContractId
- * on the matching SubscriptionInstance so renewal orders can be linked precisely.
+ * When a subscription contract activates, back-fill subscriptionContractId on the
+ * matching SubscriptionInstance using fingerprint matching. This lets the cancel
+ * webhook later find and delete the exact instance by contractId.
  */
 export const action = async ({ request }) => {
   const { shop, topic, payload } = await authenticate.webhook(request);
 
-  console.log(`[webhook] ${topic} for ${shop}`);
+  const contractId = payload?.admin_graphql_api_id;
+  console.log(`[webhook] ${topic} for ${shop} — contract=${contractId ?? "none"}`);
 
-  const contractId = payload?.admin_graphql_api_id; // gid://shopify/SubscriptionContract/...
   if (!contractId) return new Response(null, { status: 200 });
 
   try {
-    // Query the contract via GraphQL to get the customer and product line items
     const { admin } = await unauthenticated.admin(shop);
 
     const res = await admin.graphql(`
       query GetContract($id: ID!) {
         subscriptionContract(id: $id) {
-          id
-          status
           customer { id }
           lines(first: 20) {
-            nodes {
-              productId
-            }
+            nodes { productId variantId quantity }
           }
         }
       }
@@ -38,27 +34,53 @@ export const action = async ({ request }) => {
     if (!contract) return new Response(null, { status: 200 });
 
     const customerId = contract.customer?.id?.split("/").pop();
-    const productIds = (contract.lines?.nodes ?? [])
-      .map((n) => n.productId)
-      .filter(Boolean);
+    const lines = contract.lines?.nodes ?? [];
 
-    if (!customerId || productIds.length === 0) {
+    if (!customerId || lines.length === 0) {
+      console.warn(`[webhook] ${topic} — missing customer or lines for contract=${contractId}`);
       return new Response(null, { status: 200 });
     }
 
-    // Update all matching instances that don't yet have a contractId
-    await db.subscriptionInstance.updateMany({
+    // Build fingerprint matching the format in rotation.server.js
+    const fingerprint = lines
+      .map((li) => `${String(li.variantId).split("/").pop()}:${li.quantity}`)
+      .sort()
+      .join(",");
+
+    // Back-fill contractId on the exact matching instance via fingerprint
+    const { count } = await db.subscriptionInstance.updateMany({
       where: {
         shop,
         customerId,
-        targetProductId: { in: productIds },
+        lineItemFingerprint: fingerprint,
         subscriptionContractId: null,
         status: "ACTIVE",
       },
       data: { subscriptionContractId: contractId },
     });
+
+    if (count > 0) {
+      console.log(`[webhook] ${topic} — back-filled contractId on ${count} instance(s) via fingerprint=${fingerprint}`);
+      return new Response(null, { status: 200 });
+    }
+
+    // Fallback for legacy instances with no fingerprint
+    const productIds = lines.map((li) => li.productId).filter(Boolean);
+    const { count: legacyCount } = await db.subscriptionInstance.updateMany({
+      where: {
+        shop,
+        customerId,
+        targetProductId: { in: productIds },
+        lineItemFingerprint: null,
+        subscriptionContractId: null,
+        status: "ACTIVE",
+      },
+      data: { subscriptionContractId: contractId },
+    });
+
+    console.log(`[webhook] ${topic} — legacy fallback: back-filled contractId on ${legacyCount} instance(s)`);
   } catch (err) {
-    console.error(`[webhook] subscription_contracts/activate error for ${shop}:`, err.message);
+    console.error(`[webhook] ${topic} error for ${shop}:`, err.message);
   }
 
   return new Response(null, { status: 200 });
