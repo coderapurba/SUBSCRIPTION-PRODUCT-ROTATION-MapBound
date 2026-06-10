@@ -4,6 +4,27 @@ import { boundary } from "@shopify/shopify-app-react-router/server";
 import { AppProvider } from "@shopify/shopify-app-react-router/react";
 import { authenticate } from "../shopify.server";
 
+// When the server throws a redirect for re-auth (OAuth), the browser would follow
+// it inside the iframe and hit accounts.shopify.com which blocks iframe loading.
+// This component detects that case and exits the iframe before the redirect.
+function ExitIframeRedirect({ error }) {
+  useEffect(() => {
+    if (!(error instanceof Response)) return;
+    const location = error.headers?.get("Location");
+    if (!location) return;
+    try {
+      if (window !== window.top) {
+        window.top.location.assign(location);
+      } else {
+        window.location.assign(location);
+      }
+    } catch {
+      window.location.assign(location);
+    }
+  }, []);
+  return null;
+}
+
 export const loader = async ({ request }) => {
   const { session } = await authenticate.admin(request);
   return { apiKey: process.env.SHOPIFY_API_KEY || "", shop: session.shop };
@@ -31,7 +52,12 @@ export default function App() {
 }
 
 export function ErrorBoundary() {
-  return boundary.error(useRouteError());
+  const error = useRouteError();
+  // Redirect responses (re-auth / OAuth) must exit the iframe before the browser follows them.
+  if (error instanceof Response && error.status >= 300 && error.status < 400) {
+    return <ExitIframeRedirect error={error} />;
+  }
+  return boundary.error(error);
 }
 
 export const headers = (headersArgs) => boundary.headers(headersArgs);

@@ -22,9 +22,16 @@ export const loader = async ({ request, params }) => {
 
   if (!group) throw new Response("Not Found", { status: 404 });
 
-  let searchProducts = [];
-  if (q) {
-    const res = await admin.graphql(`
+  // Fetch target product image and search results in parallel
+  const [productImageRes, searchRes] = await Promise.all([
+    admin.graphql(`
+      query GetProductImage($id: ID!) {
+        product(id: $id) {
+          featuredImage { url }
+        }
+      }
+    `, { variables: { id: group.targetProductId } }),
+    q ? admin.graphql(`
       query SearchProducts($query: String!) {
         products(first: 8, query: $query) {
           nodes {
@@ -34,14 +41,20 @@ export const loader = async ({ request, params }) => {
           }
         }
       }
-    `, { variables: { query: q } });
-    const json = await res.json();
-    searchProducts = json.data?.products?.nodes ?? [];
-  }
+    `, { variables: { query: q } }) : null,
+  ]);
+
+  const productImageJson = await productImageRes.json();
+  const targetProductImage = productImageJson.data?.product?.featuredImage?.url ?? null;
+
+  const searchProducts = q
+    ? ((await searchRes.json()).data?.products?.nodes ?? [])
+    : [];
 
   return {
     group: {
       ...group,
+      targetProductImage,
       createdAt: group.createdAt.toISOString(),
       updatedAt: group.updatedAt.toISOString(),
       rotationItems: group.rotationItems.map((i) => ({
@@ -208,9 +221,18 @@ function GroupSettingsSection({ group }) {
       <div style={{ display: "flex", flexDirection: "column", gap: "20px" }}>
         {/* Target product info */}
         <div style={{ background: "#f6f6f7", borderRadius: "8px", padding: "14px 16px" }}>
-          <div style={{ fontSize: "11px", fontWeight: "600", color: "#6d7175", textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: "6px" }}>Target Product</div>
-          <div style={{ fontSize: "15px", fontWeight: "600", color: "#303030", marginBottom: "2px" }}>{group.targetProductTitle}</div>
-          <div style={{ fontFamily: "monospace", fontSize: "11px", color: "#8c9196" }}>{group.targetProductId}</div>
+          <div style={{ fontSize: "11px", fontWeight: "600", color: "#6d7175", textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: "10px" }}>Target Product</div>
+          <div style={{ display: "flex", alignItems: "center", gap: "14px" }}>
+            {group.targetProductImage ? (
+              <img src={group.targetProductImage} alt={group.targetProductTitle} style={targetThumb} />
+            ) : (
+              <div style={{ ...targetThumb, background: "#e1e3e5", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "22px" }}>📦</div>
+            )}
+            <div>
+              <div style={{ fontSize: "15px", fontWeight: "600", color: "#303030", marginBottom: "3px" }}>{group.targetProductTitle}</div>
+              <div style={{ fontFamily: "monospace", fontSize: "11px", color: "#8c9196" }}>{group.targetProductId}</div>
+            </div>
+          </div>
         </div>
 
         {/* Status toggle */}
@@ -603,6 +625,7 @@ const td = { padding: "12px 14px", verticalAlign: "middle" };
 const badgeActive   = { background: "#e3f5e9", color: "#008060", fontSize: "11px", fontWeight: "600", padding: "3px 9px", borderRadius: "12px" };
 const badgeInactive = { background: "#f6f6f7", color: "#6d7175", fontSize: "11px", fontWeight: "600", padding: "3px 9px", borderRadius: "12px" };
 
+const targetThumb  = { width: "64px", height: "64px", objectFit: "cover", borderRadius: "8px", flexShrink: 0, border: "1px solid #d9dadb" };
 const posNumber    = { width: "26px", height: "26px", borderRadius: "50%", background: "#303030", color: "#fff", fontSize: "11px", fontWeight: "700", display: "flex", alignItems: "center", justifyContent: "center" };
 const itemThumb    = { width: "40px", height: "40px", objectFit: "cover", borderRadius: "6px", flexShrink: 0, border: "1px solid #e1e3e5" };
 const emptySequence = { textAlign: "center", padding: "36px 20px", background: "#fafafa", borderRadius: "8px", border: "1px dashed #c9cccf", marginBottom: "24px" };
