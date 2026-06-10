@@ -1,4 +1,5 @@
 # Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
+# Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
 
 client_id = "df07ee6d17a8b6f7721ef1a4d462e9f4"
 application_url = "https://example.com"
