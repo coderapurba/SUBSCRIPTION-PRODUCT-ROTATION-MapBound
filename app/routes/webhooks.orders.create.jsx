@@ -17,9 +17,19 @@ export const action = async ({ request }) => {
     const { admin } = await unauthenticated.admin(shop);
     await processOrderWebhook(shop, payload, admin);
   } catch (err) {
-    // Log but return 200 so Shopify doesn't keep retrying on expected errors.
-    // Re-throw only for transient failures (handled by the rotation service).
-    console.error(`[webhook] orders/create error for ${shop}:`, err.message);
+    if (err.message?.includes("Could not find a session")) {
+      // The offline access token for this shop is missing from the database.
+      // This happens when the app hasn't been properly installed/authenticated on the store.
+      // FIX: Reinstall the app by visiting:
+      //   https://<your-vercel-url>/auth/login?shop=<shop-domain>
+      console.error(
+        `[webhook] OFFLINE SESSION MISSING for ${shop}. ` +
+        `The app needs to be reinstalled to store an offline access token. ` +
+        `Visit your app URL with /auth/login?shop=${shop} to fix this.`
+      );
+    } else {
+      console.error(`[webhook] orders/create error for ${shop}:`, err.message);
+    }
   }
 
   return new Response(null, { status: 200 });

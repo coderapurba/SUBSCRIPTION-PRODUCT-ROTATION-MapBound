@@ -57,16 +57,34 @@ async function createSubscriptionInstance(shop, orderId, customerId, contractId,
 }
 
 async function findRenewalInstance(shop, customerId, targetProductId, contractId) {
+  // Primary: exact match by contract ID (most reliable — each Loop subscription has a unique contract)
   if (contractId) {
     const inst = await db.subscriptionInstance.findFirst({
       where: { shop, subscriptionContractId: contractId, targetProductId, status: "ACTIVE" },
     });
     if (inst) return inst;
+    // Contract ID present but no instance found — log so we can investigate
+    console.warn(`[rotation] No ACTIVE instance found for contractId=${contractId} (${targetProductId}). Falling back to recency lookup.`);
   }
-  return db.subscriptionInstance.findFirst({
+
+  // Fallback: newest active instance for this customer+product.
+  // This handles the rare case where Loop doesn't include the contract ID in the renewal order.
+  // With multiple concurrent subscriptions, the most recently created instance is selected;
+  // the others will be matched correctly when their own contract ID is present.
+  const instances = await db.subscriptionInstance.findMany({
     where: { shop, customerId, targetProductId, status: "ACTIVE" },
     orderBy: { createdAt: "desc" },
   });
+
+  if (instances.length > 1) {
+    console.warn(
+      `[rotation] customer=${customerId} has ${instances.length} active instances for product=${targetProductId} ` +
+      `and no contractId was found in the order. Using most-recent instance=${instances[0].id}. ` +
+      `Other instances: ${instances.slice(1).map(i => i.id).join(", ")}`
+    );
+  }
+
+  return instances[0] ?? null;
 }
 
 // ─── Log helpers ──────────────────────────────────────────────────────────────
@@ -193,21 +211,12 @@ export async function processOrderWebhook(shop, order, admin) {
     console.log(`[rotation] order=${orderId} matched group=${group.id} product=${group.targetProductId} lineItems=${targetLineItems.length}`);
 
     if (!sourceIsLoopRenewal) {
-      // ── New subscription purchase (source_name=web or anything not Loop renewal) ──
-      // Cancel any stale ACTIVE instances for this customer+product.
-      // These are from subscriptions cancelled in Loop without our webhook receiving it.
-      // Each new purchase must start a fresh independent rotation.
-      const stale = await db.subscriptionInstance.findMany({
-        where: { shop, customerId, targetProductId: group.targetProductId, status: "ACTIVE" },
-        select: { id: true },
-      });
-      if (stale.length > 0) {
-        await db.subscriptionInstance.updateMany({
-          where: { id: { in: stale.map((s) => s.id) } },
-          data: { status: "CANCELLED" },
-        });
-        console.log(`[rotation] order=${orderId} → cancelled ${stale.length} stale instance(s) before new purchase`);
-      }
+      // ── New subscription purchase ──
+      // Create a fresh independent instance for this purchase.
+      // Do NOT cancel other active instances — the customer may hold multiple
+      // concurrent subscriptions for the same product (e.g. different quantities
+      // or variants). Each purchase must track its own rotation index independently.
+      // Real cancellations are handled by the subscription-contracts/cancel webhook.
       await createSubscriptionInstance(shop, orderId, customerId, contractId, group);
       console.log(`[rotation] order=${orderId} → new subscription purchase, fresh instance created`);
       continue;
