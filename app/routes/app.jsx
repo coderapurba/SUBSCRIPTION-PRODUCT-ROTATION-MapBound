@@ -2,7 +2,7 @@ import { useEffect } from "react";
 import { Outlet, useLoaderData, useRouteError } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { AppProvider } from "@shopify/shopify-app-react-router/react";
-import { authenticate } from "../shopify.server";
+import { authenticate, registerWebhooks } from "../shopify.server";
 
 // When the server throws a redirect for re-auth (OAuth), the browser would follow
 // it inside the iframe and hit accounts.shopify.com which blocks iframe loading.
@@ -27,6 +27,13 @@ function ExitIframeRedirect({ error }) {
 
 export const loader = async ({ request }) => {
   const { session } = await authenticate.admin(request);
+
+  // Register all webhooks for this shop on every app load.
+  // Runs fast when already registered; creates missing subscriptions otherwise.
+  registerWebhooks({ session }).catch((err) =>
+    console.error("[app] webhook registration error:", err.message)
+  );
+
   return { apiKey: process.env.SHOPIFY_API_KEY || "", shop: session.shop };
 };
 
