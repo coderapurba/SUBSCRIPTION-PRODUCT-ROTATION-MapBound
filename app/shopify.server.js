@@ -2,6 +2,7 @@ import "@shopify/shopify-app-react-router/adapters/node";
 import {
   ApiVersion,
   AppDistribution,
+  DeliveryMethod,
   shopifyApp,
 } from "@shopify/shopify-app-react-router/server";
 import { PrismaSessionStorage } from "@shopify/shopify-app-session-storage-prisma";
@@ -16,6 +17,28 @@ const shopify = shopifyApp({
   authPathPrefix: "/auth",
   sessionStorage: new PrismaSessionStorage(prisma),
   distribution: AppDistribution.AppStore,
+  webhooks: {
+    APP_UNINSTALLED: {
+      deliveryMethod: DeliveryMethod.Http,
+      callbackUrl: "/webhooks/app/uninstalled",
+    },
+    ORDERS_CREATE: {
+      deliveryMethod: DeliveryMethod.Http,
+      callbackUrl: "/webhooks/orders/create",
+    },
+    SUBSCRIPTION_CONTRACTS_UPDATE: {
+      deliveryMethod: DeliveryMethod.Http,
+      callbackUrl: "/webhooks/subscription-contracts/update",
+    },
+    SUBSCRIPTION_CONTRACTS_CANCEL: {
+      deliveryMethod: DeliveryMethod.Http,
+      callbackUrl: "/webhooks/subscription-contracts/cancel",
+    },
+    SUBSCRIPTION_CONTRACTS_ACTIVATE: {
+      deliveryMethod: DeliveryMethod.Http,
+      callbackUrl: "/webhooks/subscription-contracts/activate",
+    },
+  },
   future: {
     // Disabled in dev to avoid intermittent re-auth / login-form popup.
     // Re-enable before App Store submission if token rotation is required.
