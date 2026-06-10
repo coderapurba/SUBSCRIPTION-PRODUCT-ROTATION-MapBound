@@ -3,57 +3,52 @@ import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
 import db from "../db.server";
 
-const PAGE_SIZE = 30;
+const PAGE_SIZE = 10;
 
 export const loader = async ({ request }) => {
   const { session } = await authenticate.admin(request);
   const shop = session.shop;
-  const url = new URL(request.url);
+  const url  = new URL(request.url);
 
-  const status      = url.searchParams.get("status") ?? "";
-  const triggeredBy = url.searchParams.get("triggeredBy") ?? "";
-  const page        = Math.max(1, parseInt(url.searchParams.get("page") ?? "1", 10));
+  const status = url.searchParams.get("status") ?? "";
+  const page   = Math.max(1, parseInt(url.searchParams.get("page") ?? "1", 10));
 
-  const where = {
-    shop,
-    ...(status      ? { status }      : {}),
-    ...(triggeredBy ? { triggeredBy } : {}),
-  };
+  const where = { shop, ...(status ? { status } : {}) };
 
   const [total, logs] = await Promise.all([
     db.rotationLog.count({ where }),
     db.rotationLog.findMany({
       where,
-      orderBy: { rotatedAt: "desc" },
+      orderBy: { createdAt: "desc" },
       skip: (page - 1) * PAGE_SIZE,
       take: PAGE_SIZE,
-      include: {
-        subscriptionInstance: {
-          select: { originalOrderId: true, customerId: true, subscriptionContractId: true },
-        },
+      select: {
+        id: true, shop: true, orderId: true, customerId: true,
+        targetProductTitle: true, rotationProductTitle: true,
+        status: true, message: true, createdAt: true,
       },
     }),
   ]);
 
   return {
-    logs: logs.map((l) => ({ ...l, rotatedAt: l.rotatedAt.toISOString() })),
+    logs: logs.map((l) => ({ ...l, createdAt: l.createdAt.toISOString() })),
     total,
     page,
     totalPages: Math.ceil(total / PAGE_SIZE),
-    filters: { status, triggeredBy },
+    filters: { status },
   };
 };
 
 export default function RotationLogsPage() {
   const { logs, total, page, totalPages, filters } = useLoaderData();
   const [searchParams] = useSearchParams();
-  const hasFilters = filters.status || filters.triggeredBy;
+  const hasFilters = Boolean(filters.status);
 
   return (
     <s-page heading="Rotation Logs" back-action="/app">
 
       <s-section>
-        {/* ── Filter bar ──────────────────────────────────────────────────── */}
+        {/* ── Filter bar ────────────────────────────────────────────────── */}
         <Form method="get" style={filterBar}>
           <div style={filterGroup}>
             <label style={filterLabel}>Status</label>
@@ -64,14 +59,6 @@ export default function RotationLogsPage() {
               <option value="SKIPPED">Skipped</option>
             </select>
           </div>
-          <div style={filterGroup}>
-            <label style={filterLabel}>Triggered By</label>
-            <select name="triggeredBy" defaultValue={filters.triggeredBy} style={selectStyle}>
-              <option value="">All sources</option>
-              <option value="WEBHOOK">Webhook</option>
-              <option value="MANUAL">Manual</option>
-            </select>
-          </div>
           <div style={{ display: "flex", alignItems: "flex-end", gap: "8px" }}>
             <button type="submit" style={filterBtn}>Apply Filter</button>
             {hasFilters && (
@@ -80,7 +67,7 @@ export default function RotationLogsPage() {
           </div>
         </Form>
 
-        {/* ── Summary ─────────────────────────────────────────────────────── */}
+        {/* ── Summary ───────────────────────────────────────────────────── */}
         <div style={summaryRow}>
           <span style={{ fontSize: "14px", fontWeight: "600", color: "#303030" }}>
             {total} rotation event{total !== 1 ? "s" : ""}
@@ -93,7 +80,7 @@ export default function RotationLogsPage() {
           )}
         </div>
 
-        {/* ── Table ───────────────────────────────────────────────────────── */}
+        {/* ── Table ─────────────────────────────────────────────────────── */}
         {logs.length === 0 ? (
           <div style={emptyState}>
             <div style={{ fontSize: "40px", marginBottom: "12px" }}>📋</div>
@@ -103,8 +90,7 @@ export default function RotationLogsPage() {
             <div style={{ fontSize: "13px", color: "#6d7175" }}>
               {hasFilters
                 ? "Try adjusting your filters or clear them to see all logs"
-                : "Logs appear here after renewal orders are processed"
-              }
+                : "Logs appear here after renewal orders are processed"}
             </div>
             {hasFilters && (
               <Link to="/app/rotation-logs" style={{ ...filterBtn, marginTop: "16px", display: "inline-block", textDecoration: "none" }}>
@@ -114,15 +100,14 @@ export default function RotationLogsPage() {
           </div>
         ) : (
           <>
-            <div style={{ borderRadius: "8px", border: "1px solid #e1e3e5", overflow: "hidden" }}>
+            <div style={{ overflowX: "auto", borderRadius: "8px", border: "1px solid #e1e3e5" }}>
               <table style={tableStyle}>
                 <thead>
                   <tr>
                     <th style={th}>Order</th>
                     <th style={th}>Customer</th>
                     <th style={th}>From</th>
-                    <th style={th}>→ To</th>
-                    <th style={th}>Rotation #</th>
+                    <th style={th}>→ Rotated To</th>
                     <th style={th}>Status</th>
                     <th style={th}>Date</th>
                   </tr>
@@ -131,48 +116,28 @@ export default function RotationLogsPage() {
                   {logs.map((log) => (
                     <tr key={log.id}>
                       <td style={td}>
-                        <code style={codeChip}>#{log.subscriptionInstance?.originalOrderId ?? "—"}</code>
-                        {log.subscriptionInstance?.subscriptionContractId && (
-                          <div style={{ fontSize: "10px", color: "#8c9196", marginTop: "3px", fontFamily: "monospace" }}>
-                            contract …{log.subscriptionInstance.subscriptionContractId.split("/").pop()}
-                          </div>
-                        )}
+                        <code style={codeChip}>#{log.orderId.split("/").pop()}</code>
                       </td>
                       <td style={td}>
-                        <code style={{ fontSize: "11px", color: "#6d7175" }}>
-                          {log.subscriptionInstance?.customerId ?? "—"}
-                        </code>
+                        <code style={{ fontSize: "11px", color: "#6d7175" }}>{log.customerId}</code>
                       </td>
                       <td style={td}>
-                        <div style={{ fontSize: "13px", color: "#6d7175" }}>{log.fromProductTitle ?? "—"}</div>
-                        {log.fromProductId && (
-                          <div style={{ fontSize: "10px", color: "#8c9196", fontFamily: "monospace" }}>
-                            {log.fromProductId.split("/").pop()}
-                          </div>
-                        )}
+                        <span style={{ fontSize: "13px", color: "#6d7175" }}>{log.targetProductTitle}</span>
                       </td>
                       <td style={td}>
-                        <div style={{ fontSize: "13px", fontWeight: "500", color: "#303030" }}>{log.toProductTitle}</div>
-                        {log.toProductId && (
-                          <div style={{ fontSize: "10px", color: "#8c9196", fontFamily: "monospace" }}>
-                            {log.toProductId.split("/").pop()}
-                          </div>
-                        )}
-                      </td>
-                      <td style={td}>
-                        <div style={rotationIndexBadge}>{log.rotationIndex + 1}</div>
+                        <span style={{ fontSize: "13px", fontWeight: "500", color: "#303030" }}>{log.rotationProductTitle || "—"}</span>
                       </td>
                       <td style={td}>
                         <StatusBadge status={log.status} />
-                        {log.errorMessage && (
+                        {log.message && (
                           <div style={{ fontSize: "11px", color: "#d82c0d", marginTop: "4px", maxWidth: "200px", lineHeight: "1.3" }}>
-                            {log.errorMessage}
+                            {log.message}
                           </div>
                         )}
                       </td>
                       <td style={td}>
-                        <div style={{ fontSize: "13px", color: "#303030" }}>{new Date(log.rotatedAt).toLocaleDateString()}</div>
-                        <div style={{ fontSize: "11px", color: "#8c9196" }}>{new Date(log.rotatedAt).toLocaleTimeString()}</div>
+                        <div style={{ fontSize: "13px", color: "#303030" }}>{new Date(log.createdAt).toLocaleDateString()}</div>
+                        <div style={{ fontSize: "11px", color: "#8c9196" }}>{new Date(log.createdAt).toLocaleTimeString()}</div>
                       </td>
                     </tr>
                   ))}
@@ -238,11 +203,10 @@ const tableStyle  = { width: "100%", borderCollapse: "collapse", fontSize: "13px
 const th = { padding: "10px 14px", textAlign: "left", fontWeight: "600", fontSize: "11px", color: "#6d7175", borderBottom: "2px solid #e1e3e5", background: "#fafafa", textTransform: "uppercase", letterSpacing: "0.5px", whiteSpace: "nowrap" };
 const td = { padding: "12px 14px", verticalAlign: "middle", borderBottom: "1px solid #f1f2f3" };
 
-const codeChip         = { fontSize: "12px", background: "#f6f6f7", padding: "2px 7px", borderRadius: "4px", fontFamily: "monospace", color: "#303030" };
-const rotationIndexBadge = { width: "26px", height: "26px", borderRadius: "50%", background: "#303030", color: "#fff", fontSize: "11px", fontWeight: "700", display: "flex", alignItems: "center", justifyContent: "center" };
+const codeChip = { fontSize: "12px", background: "#f6f6f7", padding: "2px 7px", borderRadius: "4px", fontFamily: "monospace", color: "#303030" };
 
-const paginationRow  = { display: "flex", justifyContent: "center", alignItems: "center", gap: "12px", paddingTop: "16px" };
-const pageBtn        = { background: "#fff", color: "#303030", border: "1px solid #c9cccf", borderRadius: "6px", padding: "7px 14px", fontSize: "13px", fontWeight: "500", textDecoration: "none", display: "inline-block" };
+const paginationRow   = { display: "flex", justifyContent: "center", alignItems: "center", gap: "12px", paddingTop: "16px" };
+const pageBtn         = { background: "#fff", color: "#303030", border: "1px solid #c9cccf", borderRadius: "6px", padding: "7px 14px", fontSize: "13px", fontWeight: "500", textDecoration: "none", display: "inline-block" };
 const pageBtnDisabled = { background: "#f6f6f7", color: "#c9cccf", border: "1px solid #e1e3e5", borderRadius: "6px", padding: "7px 14px", fontSize: "13px", fontWeight: "500", display: "inline-block" };
 
 export const headers = (headersArgs) => boundary.headers(headersArgs);

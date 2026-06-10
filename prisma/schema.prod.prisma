@@ -47,7 +47,7 @@ model RotationGroup {
   createdAt          DateTime @default(now())
   updatedAt          DateTime @updatedAt
 
-  shopSetting   ShopSetting  @relation(fields: [shop], references: [shop])
+  shopSetting   ShopSetting            @relation(fields: [shop], references: [shop])
   rotationItems RotationItem[]
   instances     SubscriptionInstance[]
 
@@ -76,23 +76,20 @@ model RotationItem {
 }
 
 model SubscriptionInstance {
-  id                     String    @id @default(cuid())
+  id                     String   @id @default(cuid())
   shop                   String
   customerId             String
   originalOrderId        String
-  originalLineItemIds    Json
   subscriptionContractId String?
   targetProductId        String
-  currentIndex           Int       @default(0)
-  uniqueKey              String    @unique
-  status                 String    @default("ACTIVE")
-  lineItemSnapshot       Json
+  currentIndex           Int      @default(0)
+  uniqueKey              String   @unique
+  status                 String   @default("ACTIVE")
   rotationGroupId        String
-  createdAt              DateTime  @default(now())
-  updatedAt              DateTime  @updatedAt
+  createdAt              DateTime @default(now())
+  updatedAt              DateTime @updatedAt
 
   rotationGroup RotationGroup @relation(fields: [rotationGroupId], references: [id])
-  rotationLogs  RotationLog[]
 
   @@index([shop])
   @@index([shop, customerId])
@@ -101,23 +98,16 @@ model SubscriptionInstance {
 }
 
 model RotationLog {
-  id                     String   @id @default(cuid())
-  shop                   String
-  orderId                String
-  subscriptionInstanceId String
-  fromProductId          String?
-  fromProductTitle       String?
-  toProductId            String
-  toProductTitle         String
-  rotationIndex          Int
-  status                 String   @default("SUCCESS")
-  errorMessage           String?
-  triggeredBy            String   @default("WEBHOOK")
-  rotatedAt              DateTime @default(now())
-
-  subscriptionInstance SubscriptionInstance @relation(fields: [subscriptionInstanceId], references: [id], onDelete: Cascade)
+  id                   String   @id @default(cuid())
+  shop                 String
+  orderId              String
+  customerId           String
+  targetProductTitle   String
+  rotationProductTitle String
+  status               String   @default("SUCCESS")
+  message              String?
+  createdAt            DateTime @default(now())
 
   @@index([shop])
-  @@index([subscriptionInstanceId])
-  @@index([shop, rotatedAt])
+  @@index([shop, createdAt])
 }

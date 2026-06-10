@@ -10,7 +10,7 @@ export const loader = async ({ request }) => {
   const groups = await db.rotationGroup.findMany({
     where: { shop },
     orderBy: { createdAt: "desc" },
-    include: { _count: { select: { rotationItems: true, instances: true } } },
+    include: { _count: { select: { rotationItems: true } } },
   });
 
   return {
@@ -69,7 +69,6 @@ export default function RotationGroupsList() {
                 <tr>
                   <th style={th}>Target Product</th>
                   <th style={th}>Rotation Items</th>
-                  <th style={th}>Active Subs</th>
                   <th style={th}>Status</th>
                   <th style={th}>Actions</th>
                 </tr>
@@ -114,12 +113,6 @@ function GroupRow({ group }) {
         <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
           <span style={{ fontSize: "18px", fontWeight: "700", color: "#303030" }}>{group._count.rotationItems}</span>
           <span style={{ fontSize: "12px", color: "#8c9196" }}>items</span>
-        </div>
-      </td>
-      <td style={td}>
-        <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-          <span style={{ fontSize: "18px", fontWeight: "700", color: "#303030" }}>{group._count.instances}</span>
-          <span style={{ fontSize: "12px", color: "#8c9196" }}>subs</span>
         </div>
       </td>
       <td style={td}>

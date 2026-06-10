@@ -3,13 +3,8 @@
  *
  * Entry point: processOrderWebhook(shop, order, admin)
  *
- * First order  (source_name !== "subscription"):
- *   → create SubscriptionInstance, store line-item snapshot, currentIndex = 0
- *
- * Renewal order (source_name === "subscription"):
- *   → find SubscriptionInstance by contractId OR customerId+targetProduct
- *   → call performOrderEdit to swap products
- *   → advance currentIndex, write RotationLog
+ * First order  → create SubscriptionInstance (no JSON blobs, lean fields only)
+ * Renewal order → find instance by contractId or customerId+product → rotate → prune logs
  */
 
 import db from "../db.server.js";
@@ -22,86 +17,104 @@ function toNumericId(gid) {
 }
 
 function buildUniqueKey(shop, customerId, targetProductId, orderId) {
-  // targetProductId stored as GID; use numeric portion for stable key
   return `${shop}:${customerId}:${toNumericId(targetProductId)}:${orderId}`;
 }
 
-/**
- * Try to extract a SubscriptionContract GID from the order payload.
- * Shopify doesn't have a single canonical field for this across all apps,
- * so we scan note_attributes and line item properties for any value matching
- * the GID pattern.
- */
 function extractContractId(order) {
   const pattern = /gid:\/\/shopify\/SubscriptionContract\/\d+/;
-
   for (const attr of order.note_attributes ?? []) {
     if (attr.value && pattern.test(String(attr.value))) return attr.value;
   }
-
   for (const li of order.line_items ?? []) {
     for (const prop of li.properties ?? []) {
       if (prop.value && pattern.test(String(prop.value))) return prop.value;
     }
   }
-
   return null;
 }
 
 // ─── Instance helpers ─────────────────────────────────────────────────────────
 
-async function createSubscriptionInstance(shop, orderId, customerId, contractId, group, targetLineItems) {
+async function createSubscriptionInstance(shop, orderId, customerId, contractId, group) {
   const uniqueKey = buildUniqueKey(shop, customerId, group.targetProductId, orderId);
 
-  // Idempotency guard
   const existing = await db.subscriptionInstance.findUnique({ where: { uniqueKey } });
   if (existing) return existing;
-
-  const lineItemSnapshot = targetLineItems.map((li) => ({
-    lineItemId: String(li.id),
-    variantId: `gid://shopify/ProductVariant/${li.variant_id}`,
-    variantTitle: li.variant_title || "Default Title",
-    quantity: li.quantity,
-    finalLinePrice: li.final_line_price ?? String(parseFloat(li.price) * li.quantity),
-  }));
 
   return db.subscriptionInstance.create({
     data: {
       shop,
       customerId,
       originalOrderId: orderId,
-      originalLineItemIds: targetLineItems.map((li) => String(li.id)),
       subscriptionContractId: contractId ?? null,
       targetProductId: group.targetProductId,
       currentIndex: 0,
       uniqueKey,
       status: "ACTIVE",
-      lineItemSnapshot,
       rotationGroupId: group.id,
     },
   });
 }
 
 async function findRenewalInstance(shop, customerId, targetProductId, contractId) {
-  // Most precise: match by subscription contract GID
   if (contractId) {
     const inst = await db.subscriptionInstance.findFirst({
       where: { shop, subscriptionContractId: contractId, targetProductId, status: "ACTIVE" },
     });
     if (inst) return inst;
   }
-
-  // Fallback: most recent active instance for this customer + target product
   return db.subscriptionInstance.findFirst({
     where: { shop, customerId, targetProductId, status: "ACTIVE" },
     orderBy: { createdAt: "desc" },
   });
 }
 
+// ─── Log helpers ──────────────────────────────────────────────────────────────
+
+async function writeLog(shop, orderId, instance, rotationItem, group, status, message = null) {
+  await db.rotationLog.create({
+    data: {
+      shop,
+      orderId,
+      customerId: instance.customerId,
+      targetProductTitle: group.targetProductTitle,
+      rotationProductTitle: rotationItem?.productTitle ?? "",
+      status,
+      message,
+    },
+  });
+}
+
+/**
+ * Keep logs lean: delete rows older than 7 days AND keep at most 50 per shop.
+ * Called once per webhook after all processing completes.
+ */
+async function pruneOldLogs(shop) {
+  const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+
+  await db.rotationLog.deleteMany({
+    where: { shop, createdAt: { lt: cutoff } },
+  });
+
+  // Find IDs beyond the 50-row cap (newest first)
+  const overflow = await db.rotationLog.findMany({
+    where: { shop },
+    orderBy: { createdAt: "desc" },
+    skip: 50,
+    select: { id: true },
+  });
+
+  if (overflow.length > 0) {
+    await db.rotationLog.deleteMany({
+      where: { id: { in: overflow.map((r) => r.id) } },
+    });
+  }
+}
+
 // ─── Rotation ─────────────────────────────────────────────────────────────────
 
 async function rotateOrderItems(shop, orderGid, instance, group, targetLineItems, currency, admin) {
-  const activeItems = group.rotationItems; // already filtered + sorted
+  const activeItems = group.rotationItems;
 
   if (activeItems.length === 0) {
     await writeLog(shop, orderGid, instance, null, group, "SKIPPED", "No active rotation items");
@@ -109,19 +122,20 @@ async function rotateOrderItems(shop, orderGid, instance, group, targetLineItems
   }
 
   const nextIndex = instance.currentIndex % activeItems.length;
-  const nextItem = activeItems[nextIndex];
+  const nextItem  = activeItems[nextIndex];
+  const newIndex  = (nextIndex + 1) % activeItems.length;
+
+  // Skip if the rotation item points back at the target product itself (self-rotation)
+  if (toNumericId(nextItem.productId) === toNumericId(group.targetProductId)) {
+    console.log(`[rotation] order=${orderGid} rotation item at index=${nextIndex} is the target product — skipping self-rotation, advancing index`);
+    await db.subscriptionInstance.update({ where: { id: instance.id }, data: { currentIndex: newIndex } });
+    await writeLog(shop, orderGid, instance, nextItem, group, "SKIPPED", "Rotation item is the target product — self-rotation skipped");
+    return;
+  }
 
   try {
-    await performOrderEdit({
-      admin,
-      orderGid,
-      targetLineItems,
-      nextItem,
-      lineItemSnapshot: instance.lineItemSnapshot,
-      currency,
-    });
-
-    const newIndex = (nextIndex + 1) % activeItems.length;
+    // order-edit uses targetLineItems directly — no lineItemSnapshot needed
+    await performOrderEdit({ admin, orderGid, targetLineItems, nextItem, currency });
 
     await db.subscriptionInstance.update({
       where: { id: instance.id },
@@ -130,37 +144,18 @@ async function rotateOrderItems(shop, orderGid, instance, group, targetLineItems
 
     await writeLog(shop, orderGid, instance, nextItem, group, "SUCCESS");
   } catch (err) {
+    if (err.concurrent) {
+      // A concurrent webhook run already processed this order — not a failure
+      console.log(`[rotation] order=${orderGid} already processed by concurrent webhook, skipping`);
+      return;
+    }
     await writeLog(shop, orderGid, instance, nextItem, group, "FAILED", err.message);
-    throw err; // surface to webhook handler so Shopify retries
+    throw err;
   }
-}
-
-async function writeLog(shop, orderId, instance, rotationItem, group, status, errorMessage = null) {
-  await db.rotationLog.create({
-    data: {
-      shop,
-      orderId,
-      subscriptionInstanceId: instance.id,
-      fromProductId: group.targetProductId,
-      fromProductTitle: group.targetProductTitle,
-      toProductId: rotationItem?.productId ?? "",
-      toProductTitle: rotationItem?.productTitle ?? "",
-      rotationIndex: instance.currentIndex,
-      status,
-      errorMessage,
-    },
-  });
 }
 
 // ─── Main entry point ─────────────────────────────────────────────────────────
 
-/**
- * Process an orders/create webhook.
- *
- * @param {string} shop   - myshopify domain
- * @param {object} order  - raw Shopify order REST payload
- * @param {object} admin  - Shopify Admin GraphQL client (from unauthenticated.admin)
- */
 export async function processOrderWebhook(shop, order, admin) {
   await db.shopSetting.upsert({ where: { shop }, create: { shop }, update: {} });
 
@@ -170,9 +165,8 @@ export async function processOrderWebhook(shop, order, admin) {
   const contractId = extractContractId(order);
   const currency   = order.currency ?? "USD";
 
-  // source_name is "subscription" for native Shopify subscription billing.
-  // Loop and other apps may use different values, so we also check by existing instance below.
-  const sourceIsSubscription = order.source_name === "subscription";
+  // Loop renewal orders always use this source_name — anything else is a new purchase
+  const sourceIsLoopRenewal = order.source_name === "subscription_contract_checkout_one";
 
   console.log(`[rotation] order=${orderId} source_name=${order.source_name} customer=${customerId} contractId=${contractId ?? "none"}`);
 
@@ -190,7 +184,6 @@ export async function processOrderWebhook(shop, order, admin) {
 
   for (const group of groups) {
     const targetNumericId = toNumericId(group.targetProductId);
-
     const targetLineItems = (order.line_items ?? []).filter(
       (li) => String(li.product_id) === targetNumericId
     );
@@ -199,37 +192,45 @@ export async function processOrderWebhook(shop, order, admin) {
 
     console.log(`[rotation] order=${orderId} matched group=${group.id} product=${group.targetProductId} lineItems=${targetLineItems.length}`);
 
-    // Look for an existing active instance for this customer + product.
-    // If one exists, this order is a renewal — rotate regardless of source_name.
-    // This makes rotation work with Loop, ReCharge, Bold, and other subscription apps
-    // that may not set source_name="subscription".
+    if (!sourceIsLoopRenewal) {
+      // ── New subscription purchase (source_name=web or anything not Loop renewal) ──
+      // Cancel any stale ACTIVE instances for this customer+product.
+      // These are from subscriptions cancelled in Loop without our webhook receiving it.
+      // Each new purchase must start a fresh independent rotation.
+      const stale = await db.subscriptionInstance.findMany({
+        where: { shop, customerId, targetProductId: group.targetProductId, status: "ACTIVE" },
+        select: { id: true },
+      });
+      if (stale.length > 0) {
+        await db.subscriptionInstance.updateMany({
+          where: { id: { in: stale.map((s) => s.id) } },
+          data: { status: "CANCELLED" },
+        });
+        console.log(`[rotation] order=${orderId} → cancelled ${stale.length} stale instance(s) before new purchase`);
+      }
+      await createSubscriptionInstance(shop, orderId, customerId, contractId, group);
+      console.log(`[rotation] order=${orderId} → new subscription purchase, fresh instance created`);
+      continue;
+    }
+
+    // ── Loop renewal order ────────────────────────────────────────────────────
     const existingInstance = await findRenewalInstance(
       shop, customerId, group.targetProductId, contractId
     );
 
-    const isRenewal = sourceIsSubscription || existingInstance !== null;
+    console.log(`[rotation] order=${orderId} sourceIsLoopRenewal=true existingInstance=${existingInstance?.id ?? "none"}`);
 
-    console.log(`[rotation] order=${orderId} sourceIsSubscription=${sourceIsSubscription} existingInstance=${existingInstance?.id ?? "none"} isRenewal=${isRenewal}`);
-
-    if (!isRenewal) {
-      // ── Genuinely first order — create instance, do NOT rotate ────────────
-      await createSubscriptionInstance(shop, orderId, customerId, contractId, group, targetLineItems);
-      console.log(`[rotation] order=${orderId} → first order, instance created, no rotation`);
-    } else if (!existingInstance) {
-      // ── source_name says renewal but no prior instance found ───────────────
-      // Create instance now; next renewal will rotate.
-      console.warn(`[rotation] order=${orderId} → renewal but no prior instance, creating instance`);
-      await createSubscriptionInstance(shop, orderId, customerId, contractId, group, targetLineItems);
+    if (!existingInstance) {
+      // Renewal arrived before any first-order instance — create one and wait for next
+      console.warn(`[rotation] order=${orderId} → renewal but no prior instance, creating`);
+      await createSubscriptionInstance(shop, orderId, customerId, contractId, group);
     } else {
-      // ── Renewal with existing instance — rotate ────────────────────────────
-
-      // Idempotency guard: skip if we already processed this exact order for this instance
-      // (webhook can fire twice — duplicate delivery or Loop's two-phase order creation)
+      // Idempotency: skip if already processed this order
       const alreadyLogged = await db.rotationLog.findFirst({
-        where: { shop, orderId: orderGid, subscriptionInstanceId: existingInstance.id },
+        where: { shop, orderId: orderGid, customerId: existingInstance.customerId },
       });
       if (alreadyLogged) {
-        console.log(`[rotation] order=${orderId} already processed (log id=${alreadyLogged.id}), skipping duplicate`);
+        console.log(`[rotation] order=${orderId} already processed, skipping duplicate`);
         continue;
       }
 
@@ -237,4 +238,9 @@ export async function processOrderWebhook(shop, order, admin) {
       await rotateOrderItems(shop, orderGid, existingInstance, group, targetLineItems, currency, admin);
     }
   }
+
+  // Prune old logs once per webhook run (non-blocking)
+  pruneOldLogs(shop).catch((err) =>
+    console.error(`[rotation] pruneOldLogs error for ${shop}:`, err.message)
+  );
 }

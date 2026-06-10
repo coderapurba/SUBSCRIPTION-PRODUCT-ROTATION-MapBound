@@ -7,25 +7,28 @@ export const loader = async ({ request }) => {
   const { session } = await authenticate.admin(request);
   const shop = session.shop;
 
-  const [groupCount, activeItemCount, activeInstanceCount, totalLogs, recentLogs] =
+  const [groupCount, activeItemCount, totalLogs, recentLogs] =
     await Promise.all([
       db.rotationGroup.count({ where: { shop, isActive: true } }),
       db.rotationItem.count({ where: { rotationGroup: { shop }, isActive: true } }),
-      db.subscriptionInstance.count({ where: { shop, status: "ACTIVE" } }),
       db.rotationLog.count({ where: { shop } }),
       db.rotationLog.findMany({
         where: { shop },
-        orderBy: { rotatedAt: "desc" },
-        take: 8,
-        include: { subscriptionInstance: { select: { originalOrderId: true } } },
+        orderBy: { createdAt: "desc" },
+        take: 3,
+        select: {
+          id: true, orderId: true, customerId: true,
+          targetProductTitle: true, rotationProductTitle: true,
+          status: true, createdAt: true,
+        },
       }),
     ]);
 
   return {
     shop,
-    stats: { groupCount, activeItemCount, activeInstanceCount, totalLogs },
+    stats: { groupCount, activeItemCount, totalLogs },
     checklist: { hasGroups: groupCount > 0, hasItems: activeItemCount > 0 },
-    recentLogs: recentLogs.map((l) => ({ ...l, rotatedAt: l.rotatedAt.toISOString() })),
+    recentLogs: recentLogs.map((l) => ({ ...l, createdAt: l.createdAt.toISOString() })),
   };
 };
 
@@ -39,10 +42,9 @@ export default function Dashboard() {
       {/* ── Stats ─────────────────────────────────────────────────────────── */}
       <s-section heading="Overview">
         <div style={statsGrid}>
-          <StatCard value={stats.groupCount}         label="Target Products"      icon="🎯" href="/app/rotation-groups" />
-          <StatCard value={stats.activeItemCount}     label="Rotation Items"       icon="🔄" />
-          <StatCard value={stats.activeInstanceCount} label="Active Subscriptions" icon="📦" />
-          <StatCard value={stats.totalLogs}           label="Total Rotations"      icon="📊" href="/app/rotation-logs" />
+          <StatCard value={stats.groupCount}     label="Target Products" icon="🎯" href="/app/rotation-groups" />
+          <StatCard value={stats.activeItemCount} label="Rotation Items"  icon="🔄" />
+          <StatCard value={stats.totalLogs}       label="Total Rotations" icon="📊" href="/app/rotation-logs" />
         </div>
       </s-section>
 
@@ -94,11 +96,11 @@ export default function Dashboard() {
                 <tbody>
                   {recentLogs.map((log) => (
                     <tr key={log.id}>
-                      <td style={td}><code style={{ fontSize: "12px", background: "#f6f6f7", padding: "2px 6px", borderRadius: "4px" }}>#{log.subscriptionInstance?.originalOrderId ?? "—"}</code></td>
-                      <td style={td}><span style={{ color: "#6d7175" }}>{log.fromProductTitle || "—"}</span></td>
-                      <td style={td}><span style={{ fontWeight: "500" }}>{log.toProductTitle}</span></td>
+                      <td style={td}><code style={{ fontSize: "12px", background: "#f6f6f7", padding: "2px 6px", borderRadius: "4px" }}>#{log.orderId.split("/").pop()}</code></td>
+                      <td style={td}><span style={{ color: "#6d7175" }}>{log.targetProductTitle || "—"}</span></td>
+                      <td style={td}><span style={{ fontWeight: "500" }}>{log.rotationProductTitle}</span></td>
                       <td style={td}><StatusBadge status={log.status} /></td>
-                      <td style={td}><span style={{ color: "#6d7175" }}>{new Date(log.rotatedAt).toLocaleDateString()}</span></td>
+                      <td style={td}><span style={{ color: "#6d7175" }}>{new Date(log.createdAt).toLocaleDateString()}</span></td>
                     </tr>
                   ))}
                 </tbody>
@@ -169,7 +171,7 @@ function StatusBadge({ status }) {
   return <span style={{ background: s.bg, color: s.color, fontSize: "11px", fontWeight: "600", padding: "3px 8px", borderRadius: "12px" }}>{status}</span>;
 }
 
-const statsGrid = { display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: "12px" };
+const statsGrid = { display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: "12px" };
 const statCard = { background: "#fff", border: "1px solid #e1e3e5", borderRadius: "10px", padding: "20px 16px", textAlign: "center" };
 const warningBanner = { background: "#fff8e1", border: "1px solid #ffc453", borderRadius: "8px", padding: "12px 16px", marginBottom: "16px", fontSize: "13px", color: "#5c4813", display: "flex", alignItems: "center", gap: "8px" };
 const emptyState = { textAlign: "center", padding: "48px 20px", color: "#6d7175", background: "#fafafa", borderRadius: "8px", border: "1px dashed #c9cccf" };

@@ -27,7 +27,6 @@ model Session {
   refreshTokenExpires DateTime?
 }
 
-// Per-shop settings and feature flags
 model ShopSetting {
   id        String   @id @default(cuid())
   shop      String   @unique
@@ -38,17 +37,16 @@ model ShopSetting {
   rotationGroups RotationGroup[]
 }
 
-// One group = one target subscription product and its rotation sequence
 model RotationGroup {
   id                 String   @id @default(cuid())
   shop               String
-  targetProductId    String   // gid://shopify/Product/...
+  targetProductId    String
   targetProductTitle String
   isActive           Boolean  @default(true)
   createdAt          DateTime @default(now())
   updatedAt          DateTime @updatedAt
 
-  shopSetting   ShopSetting  @relation(fields: [shop], references: [shop])
+  shopSetting   ShopSetting            @relation(fields: [shop], references: [shop])
   rotationItems RotationItem[]
   instances     SubscriptionInstance[]
 
@@ -56,12 +54,11 @@ model RotationGroup {
   @@index([shop])
 }
 
-// Each entry is one product in the rotation sequence for a group
 model RotationItem {
   id              String   @id @default(cuid())
   rotationGroupId String
-  productId       String   // gid://shopify/Product/...
-  variantId       String   // gid://shopify/ProductVariant/... (default/fallback variant for Case 1)
+  productId       String
+  variantId       String
   productTitle    String
   variantTitle    String?
   sortOrder       Int
@@ -77,25 +74,24 @@ model RotationItem {
   @@index([rotationGroupId, sortOrder])
 }
 
-// Tracks each unique subscription purchase per customer per target product
+// Lean instance — only IDs, status, and rotation position.
+// JSON blobs (lineItemSnapshot, originalLineItemIds) removed; order-edit uses
+// the live webhook line items instead.
 model SubscriptionInstance {
-  id                     String    @id @default(cuid())
+  id                     String   @id @default(cuid())
   shop                   String
-  customerId             String    // Shopify numeric customer id (string)
-  originalOrderId        String    // numeric order id (string)
-  originalLineItemIds    Json      // string[]
-  subscriptionContractId String?   // gid://shopify/SubscriptionContract/...
-  targetProductId        String    // gid://shopify/Product/...
-  currentIndex           Int       @default(0)
-  uniqueKey              String    @unique // shop:customerId:targetProductId:originalOrderId
-  status                 String    @default("ACTIVE") // ACTIVE | PAUSED | CANCELLED
-  lineItemSnapshot       Json      // LineItemSnap[] — quantities/prices from first order
+  customerId             String
+  originalOrderId        String
+  subscriptionContractId String?
+  targetProductId        String
+  currentIndex           Int      @default(0)
+  uniqueKey              String   @unique
+  status                 String   @default("ACTIVE") // ACTIVE | PAUSED | CANCELLED
   rotationGroupId        String
-  createdAt              DateTime  @default(now())
-  updatedAt              DateTime  @updatedAt
+  createdAt              DateTime @default(now())
+  updatedAt              DateTime @updatedAt
 
   rotationGroup RotationGroup @relation(fields: [rotationGroupId], references: [id])
-  rotationLogs  RotationLog[]
 
   @@index([shop])
   @@index([shop, customerId])
@@ -103,25 +99,19 @@ model SubscriptionInstance {
   @@index([shop, subscriptionContractId])
 }
 
-// Immutable audit log — one row per rotation attempt
+// Lean audit log — one row per rotation attempt.
+// Capped at 50 rows per shop, auto-pruned after 7 days.
 model RotationLog {
-  id                     String   @id @default(cuid())
-  shop                   String
-  orderId                String   // gid://shopify/Order/...
-  subscriptionInstanceId String
-  fromProductId          String?
-  fromProductTitle       String?
-  toProductId            String
-  toProductTitle         String
-  rotationIndex          Int
-  status                 String   @default("SUCCESS") // SUCCESS | FAILED | SKIPPED
-  errorMessage           String?
-  triggeredBy            String   @default("WEBHOOK") // WEBHOOK | MANUAL
-  rotatedAt              DateTime @default(now())
-
-  subscriptionInstance SubscriptionInstance @relation(fields: [subscriptionInstanceId], references: [id], onDelete: Cascade)
+  id                   String   @id @default(cuid())
+  shop                 String
+  orderId              String
+  customerId           String
+  targetProductTitle   String
+  rotationProductTitle String
+  status               String   @default("SUCCESS") // SUCCESS | FAILED | SKIPPED
+  message              String?
+  createdAt            DateTime @default(now())
 
   @@index([shop])
-  @@index([subscriptionInstanceId])
-  @@index([shop, rotatedAt])
+  @@index([shop, createdAt])
 }

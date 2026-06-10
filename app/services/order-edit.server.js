@@ -24,11 +24,6 @@ async function getProductVariants(admin, productId) {
   return data?.data?.product?.variants?.nodes ?? [];
 }
 
-/**
- * Begin an order edit and return the calculatedOrder ID along with
- * all calculated line items (each has a CalculatedLineItem.id needed
- * for setQuantity/addDiscount mutations).
- */
 async function beginOrderEdit(admin, orderId) {
   const data = await gql(admin, `
     mutation OrderEditBegin($id: ID!) {
@@ -61,6 +56,7 @@ async function beginOrderEdit(admin, orderId) {
   };
 }
 
+// Returns false if the line item was already removed (concurrent webhook run processed it first)
 async function setLineItemQuantity(admin, calcOrderId, calcLineItemId, quantity) {
   const data = await gql(admin, `
     mutation OrderEditSetQuantity($id: ID!, $lineItemId: ID!, $quantity: Int!) {
@@ -71,7 +67,14 @@ async function setLineItemQuantity(admin, calcOrderId, calcLineItemId, quantity)
   `, { id: calcOrderId, lineItemId: calcLineItemId, quantity });
 
   const errors = data?.data?.orderEditSetQuantity?.userErrors;
-  if (errors?.length) throw new Error(`orderEditSetQuantity: ${errors[0].message}`);
+  if (errors?.length) {
+    const msg = errors[0].message;
+    if (msg.includes("cannot be edited because it is removed")) {
+      return false; // concurrent run already processed this order
+    }
+    throw new Error(`orderEditSetQuantity: ${msg}`);
+  }
+  return true;
 }
 
 async function addVariant(admin, calcOrderId, variantId, quantity) {
@@ -126,93 +129,111 @@ async function commitOrderEdit(admin, calcOrderId) {
   if (errors?.length) throw new Error(`orderEditCommit: ${errors[0].message}`);
 }
 
+// Returns the actual amount charged for a line item.
+// Loop sets final_line_price="0.00" on subscription orders.
+// total_discount is only populated on Shopify Plus plans.
+// discount_allocations[] is available on all plans and is the most reliable source.
+function lineTotal(li) {
+  const finalPrice = parseFloat(li.final_line_price);
+  if (Number.isFinite(finalPrice) && finalPrice > 0) return finalPrice;
+
+  const linePrice = parseFloat(li.price) * li.quantity;
+
+  // Sum discount_allocations (available on all Shopify plans)
+  const allocated = (li.discount_allocations || [])
+    .reduce((sum, d) => sum + parseFloat(d.amount || "0"), 0);
+
+  // Fall back to total_discount (Shopify Plus only) if allocations sum to zero
+  const totalDiscount = allocated > 0 ? allocated : parseFloat(li.total_discount || "0");
+
+  return linePrice - totalDiscount;
+}
+
 // ─── Public API ───────────────────────────────────────────────────────────────
 
-/**
- * Swap target subscription line items with the next rotation product.
- *
- * @param {object} opts
- * @param {object} opts.admin             - Shopify Admin GraphQL client
- * @param {string} opts.orderGid          - gid://shopify/Order/...
- * @param {object[]} opts.targetLineItems - Webhook line item objects for the target product
- * @param {object} opts.nextItem          - RotationItem from DB
- * @param {any} opts.lineItemSnapshot     - JSON snapshot stored on first order
- * @param {string} opts.currency          - ISO currency code
- */
-export async function performOrderEdit({ admin, orderGid, targetLineItems, nextItem, lineItemSnapshot, currency }) {
-  const snapshot = Array.isArray(lineItemSnapshot) ? lineItemSnapshot : [];
-
-  // ── 1. Determine Case 1 vs Case 2 ──────────────────────────────────────────
+export async function performOrderEdit({ admin, orderGid, targetLineItems, nextItem, currency }) {
+  // ── 1. Case 1 vs Case 2 ────────────────────────────────────────────────────
   const nextVariants = await getProductVariants(admin, nextItem.productId);
   const nextVariantTitleMap = new Map(nextVariants.map((v) => [v.title, v]));
 
-  const targetTitles = snapshot.map((s) => s.variantTitle);
+  const targetTitles = targetLineItems.map((li) => li.variant_title || "Default Title");
   const allTitlesMatch =
     targetTitles.length > 0 &&
     targetTitles.every((t) => nextVariantTitleMap.has(t));
 
-  console.log(`[order-edit] order=${orderGid} case=${allTitlesMatch ? "2 (variant match)" : "1 (default variant)"} snapshotItems=${snapshot.length} targetLineItems=${targetLineItems.length}`);
+  console.log(`[order-edit] order=${orderGid} case=${allTitlesMatch ? "2 (variant match)" : "1 (default variant)"} targetLineItems=${targetLineItems.length}`);
 
-  // ── 2. Begin edit — returns calcOrderId + CalculatedLineItem list ───────────
+  // ── 2. Begin edit ──────────────────────────────────────────────────────────
   const { calcOrderId, calcLineItems } = await beginOrderEdit(admin, orderGid);
 
   console.log(`[order-edit] calcOrderId=${calcOrderId} calcLineItems=${calcLineItems.length}`);
 
-  // Build a map: numeric product id → CalculatedLineItem id
-  // (CalculatedLineItem IDs are required for setQuantity/addDiscount)
-  const calcLineItemByProductId = new Map();
+  // Build map: numeric variantId → CalculatedLineItem id
+  // Keying by variantId (not productId) so multiple variants of the same product
+  // each get their own entry and all get zeroed out correctly.
+  const calcLineItemByVariantId = new Map();
   for (const cli of calcLineItems) {
-    const numericProductId = cli.variant?.product?.id?.split("/").pop();
-    if (numericProductId) {
-      calcLineItemByProductId.set(numericProductId, cli.id);
-    }
+    const numericVariantId = cli.variant?.id?.split("/").pop();
+    if (numericVariantId) calcLineItemByVariantId.set(numericVariantId, cli.id);
   }
 
-  // ── 3. Zero-out target line items using CalculatedLineItem IDs ──────────────
+  // ── 3. Zero-out every target line item ────────────────────────────────────
   for (const li of targetLineItems) {
-    const numericProductId = String(li.product_id);
-    const calcLineItemId = calcLineItemByProductId.get(numericProductId);
+    const numericVariantId = String(li.variant_id);
+    const calcLineItemId = calcLineItemByVariantId.get(numericVariantId);
 
     if (!calcLineItemId) {
-      console.warn(`[order-edit] no CalculatedLineItem found for product_id=${numericProductId}, skipping`);
+      console.warn(`[order-edit] no CalculatedLineItem found for variant_id=${numericVariantId}, skipping`);
       continue;
     }
 
-    console.log(`[order-edit] zeroing product_id=${numericProductId} calcLineItemId=${calcLineItemId}`);
-    await setLineItemQuantity(admin, calcOrderId, calcLineItemId, 0);
+    console.log(`[order-edit] zeroing variant_id=${numericVariantId} calcLineItemId=${calcLineItemId}`);
+    const zeroed = await setLineItemQuantity(admin, calcOrderId, calcLineItemId, 0);
+    if (!zeroed) {
+      const err = new Error("Order already processed by concurrent webhook run");
+      err.concurrent = true;
+      throw err;
+    }
   }
 
-  // ── 4. Add rotation items ───────────────────────────────────────────────────
+  // ── 4. Add rotation items with correct pricing ────────────────────────────
   if (allTitlesMatch) {
-    // Case 2: each target variant title exists in the rotation product
-    for (const snap of snapshot) {
-      const match = nextVariantTitleMap.get(snap.variantTitle);
+    // Case 2: each target variant title exists in the rotation product — swap per variant
+    for (const li of targetLineItems) {
+      const title = li.variant_title || "Default Title";
+      const match = nextVariantTitleMap.get(title);
       if (!match) continue;
 
-      const addedLineItemId = await addVariant(admin, calcOrderId, match.id, snap.quantity);
-      const listedTotal = parseFloat(match.price) * snap.quantity;
-      const targetTotal = parseFloat(snap.finalLinePrice);
-      await addFixedDiscount(admin, calcOrderId, addedLineItemId, listedTotal - targetTotal, currency);
+      const addedLineItemId = await addVariant(admin, calcOrderId, match.id, li.quantity);
+      // match.price = live catalog price from getProductVariants
+      const listedTotal = parseFloat(match.price) * li.quantity;
+      const targetTotal = lineTotal(li);
+      // Shopify applies fixedValue discount per unit — divide by qty to get correct line total
+      const discountPerUnit = (listedTotal - targetTotal) / li.quantity;
+      console.log(`[order-edit] case2 variant=${title} listedTotal=${listedTotal} targetTotal=${targetTotal} discountPerUnit=${discountPerUnit.toFixed(4)}`);
+      await addFixedDiscount(admin, calcOrderId, addedLineItemId, discountPerUnit, currency);
     }
   } else {
-    // Case 1: use stored default variant; combine total qty + price
-    const totalQty =
-      snapshot.reduce((s, x) => s + (x.quantity || 1), 0) ||
-      targetLineItems.reduce((s, li) => s + li.quantity, 0);
+    // Case 1: default variant — add one line item per target line item.
+    // A single combined line (qty=sum) can't represent e.g. 28.10+28.11=56.21 because
+    // Shopify's fixedValue discount is per-unit and 56.21/2=28.105 isn't representable
+    // in 2 decimal places. Adding separately keeps each price exact.
+    const rotationVariant = nextVariants.find((v) => v.id === nextItem.variantId);
+    const variantPrice = rotationVariant
+      ? parseFloat(rotationVariant.price)
+      : parseFloat(nextItem.price || "0");
 
-    const totalPrice =
-      snapshot.reduce((s, x) => s + parseFloat(x.finalLinePrice || "0"), 0) ||
-      targetLineItems.reduce(
-        (s, li) => s + parseFloat(li.final_line_price || String(parseFloat(li.price) * li.quantity)),
-        0
-      );
-
-    const addedLineItemId = await addVariant(admin, calcOrderId, nextItem.variantId, totalQty);
-    const listedTotal = parseFloat(nextItem.price || "0") * totalQty;
-    await addFixedDiscount(admin, calcOrderId, addedLineItemId, listedTotal - totalPrice, currency);
+    for (const li of targetLineItems) {
+      const listedForThis = variantPrice * li.quantity;
+      const targetForThis = lineTotal(li);
+      const discountPerUnit = (listedForThis - targetForThis) / li.quantity;
+      console.log(`[order-edit] case1 qty=${li.quantity} variantPrice=${variantPrice} listed=${listedForThis.toFixed(2)} target=${targetForThis.toFixed(2)} discountPerUnit=${discountPerUnit.toFixed(4)}`);
+      const addedLineItemId = await addVariant(admin, calcOrderId, nextItem.variantId, li.quantity);
+      await addFixedDiscount(admin, calcOrderId, addedLineItemId, discountPerUnit, currency);
+    }
   }
 
-  // ── 5. Commit ───────────────────────────────────────────────────────────────
+  // ── 5. Commit ──────────────────────────────────────────────────────────────
   await commitOrderEdit(admin, calcOrderId);
   console.log(`[order-edit] committed successfully for order=${orderGid}`);
 }
