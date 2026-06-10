@@ -49,11 +49,11 @@ async function createSubscriptionInstance(shop, orderId, customerId, contractId,
   const uniqueKey = buildUniqueKey(shop, customerId, group.targetProductId, orderId);
   const fingerprint = buildLineItemFingerprint(targetLineItems);
 
-  const existing = await db.subscriptionInstance.findUnique({ where: { uniqueKey } });
-  if (existing) return existing;
-
-  return db.subscriptionInstance.create({
-    data: {
+  // upsert is atomic — safe when Shopify delivers the same webhook twice concurrently
+  return db.subscriptionInstance.upsert({
+    where: { uniqueKey },
+    update: {},
+    create: {
       shop,
       customerId,
       originalOrderId: orderId,
