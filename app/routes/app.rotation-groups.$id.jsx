@@ -3,6 +3,7 @@ import { redirect, useLoaderData, useFetcher } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
 import db from "../db.server";
+import { Breadcrumbs } from "../components/Breadcrumbs";
 
 // ─── Loader ───────────────────────────────────────────────────────────────────
 
@@ -132,7 +133,13 @@ export default function RotationGroupDetail() {
   const { group } = useLoaderData();
 
   return (
-    <s-page heading={group.targetProductTitle} back-action="/app/rotation-groups">
+    <>
+      <Breadcrumbs crumbs={[
+        { label: "Dashboard", href: "/app" },
+        { label: "Rotation Groups", href: "/app/rotation-groups" },
+        { label: group.targetProductTitle },
+      ]} />
+      <s-page heading={group.targetProductTitle} back-action="/app/rotation-groups">
 
       <GroupSettingsSection group={group} />
       <RotationSequenceSection group={group} />
@@ -163,6 +170,7 @@ export default function RotationGroupDetail() {
       </s-section>
 
     </s-page>
+    </>
   );
 }
 

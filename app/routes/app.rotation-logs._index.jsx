@@ -2,6 +2,7 @@ import { useLoaderData, useSearchParams, Form, Link } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
 import db from "../db.server";
+import { Breadcrumbs } from "../components/Breadcrumbs";
 
 const PAGE_SIZE = 10;
 
@@ -45,7 +46,12 @@ export default function RotationLogsPage() {
   const hasFilters = Boolean(filters.status);
 
   return (
-    <s-page heading="Rotation Logs" back-action="/app">
+    <>
+      <Breadcrumbs crumbs={[
+        { label: "Dashboard", href: "/app" },
+        { label: "Rotation Logs" },
+      ]} />
+      <s-page heading="Rotation Logs" back-action="/app">
 
       <s-section>
         {/* ── Filter bar ────────────────────────────────────────────────── */}
@@ -166,6 +172,7 @@ export default function RotationLogsPage() {
       </s-section>
 
     </s-page>
+    </>
   );
 }
 

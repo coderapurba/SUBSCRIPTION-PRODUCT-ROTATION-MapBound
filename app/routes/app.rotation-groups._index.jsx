@@ -2,6 +2,7 @@ import { useLoaderData, useFetcher, Link } from "react-router";
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
 import db from "../db.server";
+import { Breadcrumbs } from "../components/Breadcrumbs";
 
 export const loader = async ({ request }) => {
   const { session } = await authenticate.admin(request);
@@ -45,7 +46,12 @@ export default function RotationGroupsList() {
   const { groups } = useLoaderData();
 
   return (
-    <s-page heading="Rotation Groups" back-action="/app">
+    <>
+      <Breadcrumbs crumbs={[
+        { label: "Dashboard", href: "/app" },
+        { label: "Rotation Groups" },
+      ]} />
+      <s-page heading="Rotation Groups" back-action="/app">
       <s-button slot="primary-action" href="/app/rotation-groups/new" variant="primary">
         + Add Target Product
       </s-button>
@@ -83,6 +89,7 @@ export default function RotationGroupsList() {
         </s-section>
       )}
     </s-page>
+    </>
   );
 }
 

@@ -3,6 +3,7 @@ import { Form, redirect, useLoaderData, useFetcher, useNavigation } from "react-
 import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
 import db from "../db.server";
+import { Breadcrumbs } from "../components/Breadcrumbs";
 
 export const loader = async ({ request }) => {
   const { admin, session } = await authenticate.admin(request);
@@ -77,7 +78,13 @@ export default function NewRotationGroup() {
   }
 
   return (
-    <s-page heading="Add Target Subscription Product" back-action="/app/rotation-groups">
+    <>
+      <Breadcrumbs crumbs={[
+        { label: "Dashboard", href: "/app" },
+        { label: "Rotation Groups", href: "/app/rotation-groups" },
+        { label: "Add Target Product" },
+      ]} />
+      <s-page heading="Add Target Subscription Product" back-action="/app/rotation-groups">
 
       <s-section heading="Search & Select Target Product">
         <div style={{ fontSize: "13px", color: "#6d7175", marginBottom: "20px", lineHeight: "1.5" }}>
@@ -194,6 +201,7 @@ export default function NewRotationGroup() {
       </s-section>
 
     </s-page>
+    </>
   );
 }
 
