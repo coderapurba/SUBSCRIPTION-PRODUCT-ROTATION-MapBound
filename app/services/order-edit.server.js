@@ -126,7 +126,17 @@ async function commitOrderEdit(admin, calcOrderId) {
   `, { id: calcOrderId });
 
   const errors = data?.data?.orderEditCommit?.userErrors;
-  if (errors?.length) throw new Error(`orderEditCommit: ${errors[0].message}`);
+  if (errors?.length) {
+    const msg = errors[0].message;
+    // "Could not save the order edit" means a concurrent webhook run already committed
+    // a conflicting edit for this order — the rotation succeeded via that run, so skip.
+    if (msg.includes("Could not save the order edit")) {
+      const err = new Error(`orderEditCommit: ${msg}`);
+      err.concurrent = true;
+      throw err;
+    }
+    throw new Error(`orderEditCommit: ${msg}`);
+  }
 }
 
 // Returns the actual amount charged for a line item.
@@ -197,39 +207,52 @@ export async function performOrderEdit({ admin, orderGid, targetLineItems, nextI
   }
 
   // ── 4. Add rotation items with correct pricing ────────────────────────────
+  //
+  // Shopify's orderEditAddLineItemDiscount fixedValue is applied PER UNIT.
+  // For qty > 1 with a non-divisible total (e.g. 49.97 for qty=2 → 24.985/unit),
+  // a single multi-unit add always rounds to 49.96 or 49.98.
+  //
+  // Fix: split every quantity into individual qty=1 adds, distributing the
+  // 1-cent remainder to the last unit so the line total is always exact.
+  // Uses integer-cent arithmetic throughout to avoid floating-point drift.
+
+  async function addUnitsExact(variantId, variantCents, targetLineItem, title) {
+    const totalCents    = Math.round(lineTotal(targetLineItem) * 100);
+    const baseUnitCents = Math.floor(totalCents / targetLineItem.quantity);
+
+    for (let i = 0; i < targetLineItem.quantity; i++) {
+      const isLast        = i === targetLineItem.quantity - 1;
+      const unitCents     = isLast ? totalCents - baseUnitCents * i : baseUnitCents;
+      const discountCents = variantCents - unitCents;
+      const discountAmt   = discountCents / 100;
+
+      console.log(`[order-edit] ${title} unit=${i+1}/${targetLineItem.quantity} unitPrice=${(unitCents/100).toFixed(2)} discount=${discountAmt.toFixed(4)}`);
+
+      const newId = await addVariant(admin, calcOrderId, variantId, 1);
+      if (discountAmt > 0) await addFixedDiscount(admin, calcOrderId, newId, discountAmt, currency);
+    }
+  }
+
   if (allTitlesMatch) {
-    // Case 2: each target variant title exists in the rotation product — swap per variant
+    // Case 2: rotation product has matching variant titles — swap each variant
     for (const li of targetLineItems) {
       const title = li.variant_title || "Default Title";
       const match = nextVariantTitleMap.get(title);
       if (!match) continue;
 
-      const addedLineItemId = await addVariant(admin, calcOrderId, match.id, li.quantity);
-      // match.price = live catalog price from getProductVariants
-      const listedTotal = parseFloat(match.price) * li.quantity;
-      const targetTotal = lineTotal(li);
-      // Shopify applies fixedValue discount per unit — divide by qty to get correct line total
-      const discountPerUnit = (listedTotal - targetTotal) / li.quantity;
-      console.log(`[order-edit] case2 variant=${title} listedTotal=${listedTotal} targetTotal=${targetTotal} discountPerUnit=${discountPerUnit.toFixed(4)}`);
-      await addFixedDiscount(admin, calcOrderId, addedLineItemId, discountPerUnit, currency);
+      const variantCents = Math.round(parseFloat(match.price) * 100);
+      await addUnitsExact(match.id, variantCents, li, `case2 variant=${title}`);
     }
   } else {
-    // Case 1: default variant — add one line item per target line item.
-    // A single combined line (qty=sum) can't represent e.g. 28.10+28.11=56.21 because
-    // Shopify's fixedValue discount is per-unit and 56.21/2=28.105 isn't representable
-    // in 2 decimal places. Adding separately keeps each price exact.
+    // Case 1: rotation product uses its default variant
     const rotationVariant = nextVariants.find((v) => v.id === nextItem.variantId);
     const variantPrice = rotationVariant
       ? parseFloat(rotationVariant.price)
       : parseFloat(nextItem.price || "0");
+    const variantCents = Math.round(variantPrice * 100);
 
     for (const li of targetLineItems) {
-      const listedForThis = variantPrice * li.quantity;
-      const targetForThis = lineTotal(li);
-      const discountPerUnit = (listedForThis - targetForThis) / li.quantity;
-      console.log(`[order-edit] case1 qty=${li.quantity} variantPrice=${variantPrice} listed=${listedForThis.toFixed(2)} target=${targetForThis.toFixed(2)} discountPerUnit=${discountPerUnit.toFixed(4)}`);
-      const addedLineItemId = await addVariant(admin, calcOrderId, nextItem.variantId, li.quantity);
-      await addFixedDiscount(admin, calcOrderId, addedLineItemId, discountPerUnit, currency);
+      await addUnitsExact(nextItem.variantId, variantCents, li, `case1`);
     }
   }
 
