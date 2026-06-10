@@ -171,10 +171,28 @@ export default function RotationGroupDetail() {
 function GroupSettingsSection({ group }) {
   const fetcher = useFetcher();
   const [isActive, setIsActive] = useState(group.isActive);
+  const [showDeleteModal, setShowDeleteModal] = useState(false);
   const isBusy = fetcher.state !== "idle";
 
   return (
     <s-section heading="Group Settings">
+      <ConfirmModal
+        isOpen={showDeleteModal}
+        icon="⚠️"
+        title="Delete rotation group?"
+        message={
+          <span>
+            <strong style={{ color: "#303030" }}>{group.targetProductTitle}</strong>
+            <span style={{ display: "block", marginTop: "6px", color: "#6d7175" }}>
+              All rotation items will be permanently deleted. Active subscriptions will no longer be rotated. This cannot be undone.
+            </span>
+          </span>
+        }
+        confirmLabel="Delete Group"
+        confirmStyle="critical"
+        onConfirm={() => { setShowDeleteModal(false); fetcher.submit({ intent: "deleteGroup" }, { method: "post" }); }}
+        onCancel={() => setShowDeleteModal(false)}
+      />
       {fetcher.data?.success && (
         <div style={successBanner}>{fetcher.data.success}</div>
       )}
@@ -211,11 +229,7 @@ function GroupSettingsSection({ group }) {
           </button>
           <button
             type="button"
-            onClick={() => {
-              if (confirm("Delete this rotation group and all its items?\n\nThis cannot be undone. Active subscriptions will no longer be rotated.")) {
-                fetcher.submit({ intent: "deleteGroup" }, { method: "post" });
-              }
-            }}
+            onClick={() => setShowDeleteModal(true)}
             disabled={isBusy}
             style={criticalBtn}
           >
@@ -281,10 +295,39 @@ function RotationSequenceSection({ group }) {
   );
 }
 
+// ─── Confirm Modal ────────────────────────────────────────────────────────────
+
+function ConfirmModal({ isOpen, icon, title, message, confirmLabel, confirmStyle, onConfirm, onCancel }) {
+  if (!isOpen) return null;
+  return (
+    <div style={modalOverlay} onClick={onCancel}>
+      <div style={modalCard} onClick={(e) => e.stopPropagation()}>
+        {/* Icon */}
+        <div style={modalIconWrap}>
+          <span style={{ fontSize: "22px" }}>{icon}</span>
+        </div>
+        {/* Content */}
+        <div style={{ flex: 1 }}>
+          <div style={modalTitle}>{title}</div>
+          <div style={modalMessage}>{message}</div>
+        </div>
+        {/* Actions */}
+        <div style={modalActions}>
+          <button type="button" onClick={onCancel}  style={modalCancelBtn}>Cancel</button>
+          <button type="button" onClick={onConfirm} style={confirmStyle === "critical" ? modalConfirmCritBtn : modalConfirmBtn}>
+            {confirmLabel}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ─── Item Row ─────────────────────────────────────────────────────────────────
 
 function RotationItemRow({ item, idx, isFirst, isLast }) {
   const fetcher = useFetcher();
+  const [showRemoveModal, setShowRemoveModal] = useState(false);
   const isBusy = fetcher.state !== "idle";
 
   const submit = (intent, extra = {}) => {
@@ -292,53 +335,76 @@ function RotationItemRow({ item, idx, isFirst, isLast }) {
   };
 
   return (
-    <tr style={{ borderBottom: "1px solid #f1f2f3", opacity: isBusy ? 0.6 : 1, transition: "opacity 0.15s" }}>
-      <td style={td}>
-        <div style={posNumber}>{idx + 1}</div>
-      </td>
-      <td style={td}>
-        <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-          {item.imageUrl
-            ? <img src={item.imageUrl} alt="" style={itemThumb} />
-            : <div style={{ ...itemThumb, background: "#f1f2f3", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "16px" }}>📦</div>
-          }
-          <div>
-            <div style={{ fontSize: "13px", fontWeight: "600", color: "#303030" }}>{item.productTitle}</div>
-            <div style={{ fontSize: "11px", color: "#8c9196", fontFamily: "monospace" }}>{item.productId.split("/").pop()}</div>
+    <>
+      <ConfirmModal
+        isOpen={showRemoveModal}
+        icon="🗑️"
+        title="Remove from rotation?"
+        message={
+          <span>
+            <strong style={{ color: "#303030" }}>{item.productTitle}</strong>
+            {item.variantTitle && item.variantTitle !== "Default Title" && (
+              <span style={{ color: "#6d7175" }}> — {item.variantTitle}</span>
+            )}
+            <span style={{ display: "block", marginTop: "6px", color: "#6d7175" }}>
+              This item will be removed from the rotation sequence. Existing orders are not affected.
+            </span>
+          </span>
+        }
+        confirmLabel="Remove"
+        confirmStyle="critical"
+        onConfirm={() => { setShowRemoveModal(false); submit("deleteItem"); }}
+        onCancel={() => setShowRemoveModal(false)}
+      />
+
+      <tr style={{ borderBottom: "1px solid #f1f2f3", opacity: isBusy ? 0.6 : 1, transition: "opacity 0.15s" }}>
+        <td style={td}>
+          <div style={posNumber}>{idx + 1}</div>
+        </td>
+        <td style={td}>
+          <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+            {item.imageUrl
+              ? <img src={item.imageUrl} alt="" style={itemThumb} />
+              : <div style={{ ...itemThumb, background: "#f1f2f3", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "16px" }}>📦</div>
+            }
+            <div>
+              <div style={{ fontSize: "13px", fontWeight: "600", color: "#303030" }}>{item.productTitle}</div>
+              <div style={{ fontSize: "11px", color: "#8c9196", fontFamily: "monospace" }}>{item.productId.split("/").pop()}</div>
+            </div>
           </div>
-        </div>
-      </td>
-      <td style={td}>
-        <div style={{ fontSize: "13px", color: "#303030" }}>{item.variantTitle ?? "Default Title"}</div>
-        <div style={{ fontSize: "11px", color: "#8c9196", fontFamily: "monospace" }}>{item.variantId.split("/").pop()}</div>
-      </td>
-      <td style={td}>
-        <span style={{ fontSize: "13px", fontWeight: "600", color: "#303030" }}>
-          {item.price ? `$${item.price}` : "—"}
-        </span>
-      </td>
-      <td style={td}>
-        <span style={item.isActive ? badgeActive : badgeInactive}>
-          {item.isActive ? "Active" : "Paused"}
-        </span>
-      </td>
-      <td style={{ ...td, whiteSpace: "nowrap" }}>
-        <div style={{ display: "flex", gap: "4px", alignItems: "center" }}>
-          <button type="button" onClick={() => submit("moveItem", { direction: "up" })}   disabled={isFirst || isBusy} style={{ ...iconBtn, opacity: isFirst ? 0.3 : 1 }} title="Move up">▲</button>
-          <button type="button" onClick={() => submit("moveItem", { direction: "down" })} disabled={isLast  || isBusy} style={{ ...iconBtn, opacity: isLast  ? 0.3 : 1 }} title="Move down">▼</button>
-          <button type="button" onClick={() => submit("toggleItem")} disabled={isBusy} style={smallSecBtn} title={item.isActive ? "Pause this item" : "Activate this item"}>
-            {item.isActive ? "Pause" : "Activate"}
-          </button>
-          <button
-            type="button"
-            onClick={() => { if (confirm(`Remove "${item.productTitle}" from rotation?`)) submit("deleteItem"); }}
-            disabled={isBusy}
-            style={smallCritBtn}
-            title="Remove from rotation"
-          >Remove</button>
-        </div>
-      </td>
-    </tr>
+        </td>
+        <td style={td}>
+          <div style={{ fontSize: "13px", color: "#303030" }}>{item.variantTitle ?? "Default Title"}</div>
+          <div style={{ fontSize: "11px", color: "#8c9196", fontFamily: "monospace" }}>{item.variantId.split("/").pop()}</div>
+        </td>
+        <td style={td}>
+          <span style={{ fontSize: "13px", fontWeight: "600", color: "#303030" }}>
+            {item.price ? `$${item.price}` : "—"}
+          </span>
+        </td>
+        <td style={td}>
+          <span style={item.isActive ? badgeActive : badgeInactive}>
+            {item.isActive ? "Active" : "Paused"}
+          </span>
+        </td>
+        <td style={{ ...td, whiteSpace: "nowrap" }}>
+          <div style={{ display: "flex", gap: "4px", alignItems: "center" }}>
+            <button type="button" onClick={() => submit("moveItem", { direction: "up" })}   disabled={isFirst || isBusy} style={{ ...iconBtn, opacity: isFirst ? 0.3 : 1 }} title="Move up">▲</button>
+            <button type="button" onClick={() => submit("moveItem", { direction: "down" })} disabled={isLast  || isBusy} style={{ ...iconBtn, opacity: isLast  ? 0.3 : 1 }} title="Move down">▼</button>
+            <button type="button" onClick={() => submit("toggleItem")} disabled={isBusy} style={smallSecBtn} title={item.isActive ? "Pause this item" : "Activate this item"}>
+              {item.isActive ? "Pause" : "Activate"}
+            </button>
+            <button
+              type="button"
+              onClick={() => setShowRemoveModal(true)}
+              disabled={isBusy}
+              style={smallCritBtn}
+              title="Remove from rotation"
+            >Remove</button>
+          </div>
+        </td>
+      </tr>
+    </>
   );
 }
 
@@ -545,5 +611,38 @@ const previewThumb = { width: "48px", height: "48px", objectFit: "cover", border
 
 const successBanner = { background: "#e3f5e9", color: "#008060", border: "1px solid #b3dfcc", borderRadius: "8px", padding: "10px 14px", fontSize: "13px", marginBottom: "16px" };
 const codeStyle = { fontSize: "11px", background: "#f6f6f7", padding: "2px 6px", borderRadius: "4px", fontFamily: "monospace", wordBreak: "break-all" };
+
+// ─── Modal styles ─────────────────────────────────────────────────────────────
+
+const modalOverlay = {
+  position: "fixed", inset: 0, zIndex: 1000,
+  background: "rgba(0,0,0,0.45)",
+  display: "flex", alignItems: "center", justifyContent: "center",
+  padding: "20px",
+};
+const modalCard = {
+  background: "#fff",
+  borderRadius: "12px",
+  boxShadow: "0 8px 32px rgba(0,0,0,0.18), 0 2px 8px rgba(0,0,0,0.10)",
+  padding: "24px",
+  width: "100%",
+  maxWidth: "420px",
+  display: "flex",
+  flexDirection: "column",
+  gap: "16px",
+  animation: "modalIn 0.15s ease",
+};
+const modalIconWrap = {
+  width: "44px", height: "44px", borderRadius: "50%",
+  background: "#fff5e5", border: "1px solid #ffc453",
+  display: "flex", alignItems: "center", justifyContent: "center",
+  flexShrink: 0,
+};
+const modalTitle   = { fontSize: "16px", fontWeight: "700", color: "#303030", marginBottom: "4px" };
+const modalMessage = { fontSize: "13px", color: "#6d7175", lineHeight: "1.6" };
+const modalActions = { display: "flex", justifyContent: "flex-end", gap: "8px", paddingTop: "4px" };
+const modalCancelBtn     = { background: "#fff", color: "#303030", border: "1px solid #c9cccf", borderRadius: "8px", padding: "9px 18px", fontSize: "13px", fontWeight: "500", cursor: "pointer", fontFamily: "inherit" };
+const modalConfirmBtn    = { background: "#303030", color: "#fff", border: "none", borderRadius: "8px", padding: "9px 18px", fontSize: "13px", fontWeight: "500", cursor: "pointer", fontFamily: "inherit" };
+const modalConfirmCritBtn = { background: "#d82c0d", color: "#fff", border: "none", borderRadius: "8px", padding: "9px 18px", fontSize: "13px", fontWeight: "500", cursor: "pointer", fontFamily: "inherit" };
 
 export const headers = (headersArgs) => boundary.headers(headersArgs);
