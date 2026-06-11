@@ -81,7 +81,13 @@ async function addVariant(admin, calcOrderId, variantId, quantity) {
   const data = await gql(admin, `
     mutation OrderEditAddVariant($id: ID!, $variantId: ID!, $quantity: Int!) {
       orderEditAddVariant(id: $id, variantId: $variantId, quantity: $quantity, allowDuplicates: true) {
-        calculatedLineItem { id }
+        calculatedLineItem {
+          id
+          unitPriceSet {
+            presentmentMoney { amount currencyCode }
+            shopMoney { amount currencyCode }
+          }
+        }
         userErrors { field message }
       }
     }
@@ -89,7 +95,19 @@ async function addVariant(admin, calcOrderId, variantId, quantity) {
 
   const errors = data?.data?.orderEditAddVariant?.userErrors;
   if (errors?.length) throw new Error(`orderEditAddVariant: ${errors[0].message}`);
-  return data.data.orderEditAddVariant.calculatedLineItem.id;
+
+  const li = data.data.orderEditAddVariant.calculatedLineItem;
+  // Prefer presentmentMoney (the order's display currency) — this is what the customer
+  // is actually charged and is already in the correct currency for discount calculation.
+  const pm = li.unitPriceSet?.presentmentMoney;
+  const sm = li.unitPriceSet?.shopMoney;
+  const money = pm?.amount && parseFloat(pm.amount) > 0 ? pm : sm;
+
+  return {
+    id: li.id,
+    unitPrice: parseFloat(money?.amount ?? "0"),
+    currencyCode: money?.currencyCode,
+  };
 }
 
 async function addFixedDiscount(admin, calcOrderId, lineItemId, amount, currencyCode) {
@@ -216,20 +234,33 @@ export async function performOrderEdit({ admin, orderGid, targetLineItems, nextI
   // 1-cent remainder to the last unit so the line total is always exact.
   // Uses integer-cent arithmetic throughout to avoid floating-point drift.
 
-  async function addUnitsExact(variantId, variantCents, targetLineItem, title) {
+  async function addUnitsExact(variantId, targetLineItem, title) {
     const totalCents    = Math.round(lineTotal(targetLineItem) * 100);
     const baseUnitCents = Math.floor(totalCents / targetLineItem.quantity);
 
     for (let i = 0; i < targetLineItem.quantity; i++) {
-      const isLast        = i === targetLineItem.quantity - 1;
-      const unitCents     = isLast ? totalCents - baseUnitCents * i : baseUnitCents;
+      const isLast    = i === targetLineItem.quantity - 1;
+      const unitCents = isLast ? totalCents - baseUnitCents * i : baseUnitCents;
+
+      // Add the variant first, then read back its actual price in the order's
+      // presentment currency — avoids currency mismatch when order currency
+      // (e.g. USD via Loop) differs from the store's base currency (e.g. AUD).
+      const { id: newId, unitPrice, currencyCode: variantCurrency } =
+        await addVariant(admin, calcOrderId, variantId, 1);
+
+      const variantCents  = Math.round(unitPrice * 100);
       const discountCents = variantCents - unitCents;
       const discountAmt   = discountCents / 100;
 
-      console.log(`[order-edit] ${title} unit=${i+1}/${targetLineItem.quantity} unitPrice=${(unitCents/100).toFixed(2)} discount=${discountAmt.toFixed(4)}`);
+      console.log(
+        `[order-edit] ${title} unit=${i+1}/${targetLineItem.quantity} ` +
+        `paidPrice=${(unitCents/100).toFixed(2)} variantPrice=${unitPrice.toFixed(2)} ` +
+        `discount=${discountAmt.toFixed(4)} currency=${variantCurrency ?? currency}`
+      );
 
-      const newId = await addVariant(admin, calcOrderId, variantId, 1);
-      if (discountAmt > 0) await addFixedDiscount(admin, calcOrderId, newId, discountAmt, currency);
+      if (discountAmt > 0) {
+        await addFixedDiscount(admin, calcOrderId, newId, discountAmt, variantCurrency ?? currency);
+      }
     }
   }
 
@@ -240,19 +271,12 @@ export async function performOrderEdit({ admin, orderGid, targetLineItems, nextI
       const match = nextVariantTitleMap.get(title);
       if (!match) continue;
 
-      const variantCents = Math.round(parseFloat(match.price) * 100);
-      await addUnitsExact(match.id, variantCents, li, `case2 variant=${title}`);
+      await addUnitsExact(match.id, li, `case2 variant=${title}`);
     }
   } else {
     // Case 1: rotation product uses its default variant
-    const rotationVariant = nextVariants.find((v) => v.id === nextItem.variantId);
-    const variantPrice = rotationVariant
-      ? parseFloat(rotationVariant.price)
-      : parseFloat(nextItem.price || "0");
-    const variantCents = Math.round(variantPrice * 100);
-
     for (const li of targetLineItems) {
-      await addUnitsExact(nextItem.variantId, variantCents, li, `case1`);
+      await addUnitsExact(nextItem.variantId, li, `case1`);
     }
   }
 
