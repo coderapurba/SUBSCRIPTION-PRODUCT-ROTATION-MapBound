@@ -157,23 +157,29 @@ async function commitOrderEdit(admin, calcOrderId) {
   }
 }
 
-// Returns the actual amount charged for a line item.
-// Loop sets final_line_price="0.00" on subscription orders.
-// total_discount is only populated on Shopify Plus plans.
-// discount_allocations[] is available on all plans and is the most reliable source.
+// Returns the actual amount charged for a line item in the store's base currency.
+// Must use price_set.shop_money so the result is always in the same currency as
+// originalUnitPriceSet.presentmentMoney on CalculatedLineItem. If we used
+// final_line_price or price instead, we'd get USD on Loop/AUD stores while the
+// variant price is in AUD — causing a wrong discount and a "Partially paid" order.
 function lineTotal(li) {
+  if (li.price_set?.shop_money?.amount) {
+    const linePrice = parseFloat(li.price_set.shop_money.amount) * (li.quantity || 1);
+    const discount  = (li.discount_allocations || []).reduce((sum, d) => {
+      const amt = d.amount_set?.shop_money?.amount ?? d.amount ?? "0";
+      return sum + parseFloat(amt);
+    }, 0);
+    return linePrice - discount;
+  }
+
+  // Fallback for older webhook payloads that don't include price_set
   const finalPrice = parseFloat(li.final_line_price);
   if (Number.isFinite(finalPrice) && finalPrice > 0) return finalPrice;
 
   const linePrice = parseFloat(li.price) * li.quantity;
-
-  // Sum discount_allocations (available on all Shopify plans)
   const allocated = (li.discount_allocations || [])
     .reduce((sum, d) => sum + parseFloat(d.amount || "0"), 0);
-
-  // Fall back to total_discount (Shopify Plus only) if allocations sum to zero
   const totalDiscount = allocated > 0 ? allocated : parseFloat(li.total_discount || "0");
-
   return linePrice - totalDiscount;
 }
 
