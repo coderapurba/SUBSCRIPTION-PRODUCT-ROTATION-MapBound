@@ -7,7 +7,7 @@ function buildDatabaseUrl() {
   // Serverless: limit each function instance to 1 connection to avoid exhausting
   // the Prisma Postgres free-tier connection limit across concurrent invocations.
   if (process.env.NODE_ENV === "production" && !url.includes("connection_limit")) {
-    return `${url}&connection_limit=1&pool_timeout=20`;
+    return `${url}&connection_limit=2&pool_timeout=20`;
   }
   return url;
 }
