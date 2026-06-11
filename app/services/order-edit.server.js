@@ -83,7 +83,7 @@ async function addVariant(admin, calcOrderId, variantId, quantity) {
       orderEditAddVariant(id: $id, variantId: $variantId, quantity: $quantity, allowDuplicates: true) {
         calculatedLineItem {
           id
-          unitPriceSet {
+          originalUnitPriceSet {
             presentmentMoney { amount currencyCode }
             shopMoney { amount currencyCode }
           }
@@ -99,8 +99,8 @@ async function addVariant(admin, calcOrderId, variantId, quantity) {
   const li = data.data.orderEditAddVariant.calculatedLineItem;
   // Prefer presentmentMoney (the order's display currency) — this is what the customer
   // is actually charged and is already in the correct currency for discount calculation.
-  const pm = li.unitPriceSet?.presentmentMoney;
-  const sm = li.unitPriceSet?.shopMoney;
+  const pm = li.originalUnitPriceSet?.presentmentMoney;
+  const sm = li.originalUnitPriceSet?.shopMoney;
   const money = pm?.amount && parseFloat(pm.amount) > 0 ? pm : sm;
 
   return {
