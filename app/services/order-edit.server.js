@@ -157,16 +157,17 @@ async function commitOrderEdit(admin, calcOrderId) {
   }
 }
 
-// Returns the actual amount charged for a line item in the store's base currency.
-// Must use price_set.shop_money so the result is always in the same currency as
-// originalUnitPriceSet.presentmentMoney on CalculatedLineItem. If we used
-// final_line_price or price instead, we'd get USD on Loop/AUD stores while the
-// variant price is in AUD — causing a wrong discount and a "Partially paid" order.
+// Returns the amount paid for a line item in the order's PRESENTMENT currency.
+// presentment_money matches originalUnitPriceSet.presentmentMoney on CalculatedLineItem,
+// so the discount calculation is always in the same currency regardless of:
+//   - Loop billing in a different currency than the store base (e.g. USD billing on AUD store)
+//   - Multi-market stores where base currency ≠ checkout currency (e.g. BDT base + AUD market)
 function lineTotal(li) {
-  if (li.price_set?.shop_money?.amount) {
-    const linePrice = parseFloat(li.price_set.shop_money.amount) * (li.quantity || 1);
+  if (li.price_set?.presentment_money?.amount) {
+    const unitPrice = parseFloat(li.price_set.presentment_money.amount);
+    const linePrice = unitPrice * (li.quantity || 1);
     const discount  = (li.discount_allocations || []).reduce((sum, d) => {
-      const amt = d.amount_set?.shop_money?.amount ?? d.amount ?? "0";
+      const amt = d.amount_set?.presentment_money?.amount ?? d.amount ?? "0";
       return sum + parseFloat(amt);
     }, 0);
     return linePrice - discount;
