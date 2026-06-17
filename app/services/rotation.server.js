@@ -198,67 +198,78 @@ async function rotateOrderItems(shop, orderGid, instance, group, targetLineItems
   const newIndex  = (nextIndex + 1) % activeItems.length;
 
   if (toNumericId(nextItem.productId) === toNumericId(group.targetProductId)) {
+    const claimed = await db.subscriptionInstance.updateMany({
+      where: { id: instance.id, currentIndex: instance.currentIndex },
+      data: { currentIndex: newIndex },
+    });
+    if (claimed.count === 0) {
+      console.log(`[rotation] order=${orderGid} self-rotation slot already claimed by concurrent run`);
+      return;
+    }
     console.log(`[rotation] order=${orderGid} rotation item at index=${nextIndex} is the target product — skipping self-rotation, advancing index`);
-    await db.subscriptionInstance.update({ where: { id: instance.id }, data: { currentIndex: newIndex } });
     await writeLog(shop, orderGid, instance, nextItem, group, "SKIPPED", "Rotation item is the target product — self-rotation skipped");
     return;
   }
 
+  // ── Optimistic lock ────────────────────────────────────────────────────────
+  // Atomically advance currentIndex only if it still matches what we read.
+  // Exactly one concurrent run wins (count=1); all others see count=0 and bail.
+  // This is the primary concurrency gate — zero-out alone is insufficient because
+  // concurrent runs each get their own calculatedOrder from orderEditBegin, so
+  // additive edits (skipZeroOut=true) can all commit without any Shopify conflict.
+  const claimed = await db.subscriptionInstance.updateMany({
+    where: { id: instance.id, currentIndex: instance.currentIndex },
+    data: { currentIndex: newIndex },
+  });
+
+  if (claimed.count === 0) {
+    console.log(`[rotation] order=${orderGid} rotation slot already claimed by concurrent run — skipping`);
+    return;
+  }
+
+  console.log(`[rotation] order=${orderGid} claimed slot index=${nextIndex}→${newIndex}`);
+
   try {
-    await performOrderEdit({ admin, orderGid, targetLineItems, nextItem, currency, freeRotation: group.freeRotation ?? false, keepTargetProduct: group.keepTargetProduct ?? false });
-
-    await db.subscriptionInstance.update({
-      where: { id: instance.id },
-      data: { currentIndex: newIndex },
+    await performOrderEdit({
+      admin, orderGid, targetLineItems, nextItem, currency,
+      freeRotation: group.freeRotation ?? false,
+      keepTargetProduct: group.keepTargetProduct ?? false,
     });
-
     await writeLog(shop, orderGid, instance, nextItem, group, "SUCCESS");
   } catch (err) {
     if (err.concurrent) {
       if (err.message.includes("Order already processed by concurrent webhook run")) {
-        // Zero-out detected another run already modified the order — that run will commit.
-        console.log(`[rotation] order=${orderGid} skipped — concurrent run has the lock`);
+        // Zero-out saw a conflicting change (rare with the DB lock). Roll back so
+        // the next renewal retries at this slot.
+        console.log(`[rotation] order=${orderGid} zero-out conflict (unexpected with lock) — rolling back index`);
+        await db.subscriptionInstance.update({ where: { id: instance.id }, data: { currentIndex: instance.currentIndex } });
       } else {
-        // Commit rejected — could be concurrent conflict OR order was fulfilled before
-        // we could commit (Shopify rejects removal of fulfilled line items).
-        console.warn(`[rotation] order=${orderGid} commit failed — ${err.message}`);
-
-        // Check if another concurrent run already succeeded
-        const anotherRunSucceeded = await db.rotationLog.findFirst({
-          where: { shop, orderId: orderGid, status: "SUCCESS" },
-        });
-        if (anotherRunSucceeded) {
-          console.log(`[rotation] order=${orderGid} commit failed but another run already succeeded — skipping`);
-        } else {
-          // No other run succeeded. The order was likely fulfilled before our edit committed.
-          // Retry as additive edit: add rotation product without removing the fulfilled original.
-          // Customer gets both products; Digital Downloads will fulfill the new item automatically.
-          console.log(`[rotation] order=${orderGid} retrying as additive edit (order may be fulfilled)`);
-          try {
-            await performOrderEdit({
-              admin, orderGid, targetLineItems, nextItem, currency,
-              freeRotation: group.freeRotation ?? false,
-              keepTargetProduct: false,
-              skipZeroOut: true,
-            });
-            await db.subscriptionInstance.update({ where: { id: instance.id }, data: { currentIndex: newIndex } });
-            await writeLog(shop, orderGid, instance, nextItem, group, "SUCCESS",
-              "Additive rotation — product added alongside fulfilled original");
-            console.log(`[rotation] order=${orderGid} additive edit succeeded`);
-          } catch (retryErr) {
-            console.warn(`[rotation] order=${orderGid} additive retry also failed: ${retryErr.message}`);
-            const nowSucceeded = await db.rotationLog.findFirst({
-              where: { shop, orderId: orderGid, status: "SUCCESS" },
-            });
-            if (!nowSucceeded) {
-              await writeLog(shop, orderGid, instance, nextItem, group, "FAILED",
-                `Both edit attempts failed: ${retryErr.message}`);
-            }
-          }
+        // Commit failed — order is likely already fulfilled (Shopify rejects removing
+        // fulfilled line items). Retry as additive: add rotation product without
+        // removing the original. Customer gets both; Digital Downloads fulfills the new item.
+        console.warn(`[rotation] order=${orderGid} commit failed, retrying as additive edit`);
+        try {
+          await performOrderEdit({
+            admin, orderGid, targetLineItems, nextItem, currency,
+            freeRotation: group.freeRotation ?? false,
+            keepTargetProduct: false,
+            skipZeroOut: true,
+          });
+          await writeLog(shop, orderGid, instance, nextItem, group, "SUCCESS",
+            "Additive rotation — product added alongside fulfilled original");
+          console.log(`[rotation] order=${orderGid} additive edit succeeded`);
+        } catch (retryErr) {
+          // Both attempts failed — roll back index so next renewal retries this slot
+          console.warn(`[rotation] order=${orderGid} additive retry also failed: ${retryErr.message}`);
+          await db.subscriptionInstance.update({ where: { id: instance.id }, data: { currentIndex: instance.currentIndex } });
+          await writeLog(shop, orderGid, instance, nextItem, group, "FAILED",
+            `Both edit attempts failed: ${retryErr.message}`);
         }
       }
       return;
     }
+    // Unexpected error — roll back index and re-throw
+    await db.subscriptionInstance.update({ where: { id: instance.id }, data: { currentIndex: instance.currentIndex } });
     await writeLog(shop, orderGid, instance, nextItem, group, "FAILED", err.message);
     throw err;
   }
