@@ -194,7 +194,7 @@ async function rotateOrderItems(shop, orderGid, instance, group, targetLineItems
   }
 
   try {
-    await performOrderEdit({ admin, orderGid, targetLineItems, nextItem, currency });
+    await performOrderEdit({ admin, orderGid, targetLineItems, nextItem, currency, freeRotation: group.freeRotation ?? false });
 
     await db.subscriptionInstance.update({
       where: { id: instance.id },

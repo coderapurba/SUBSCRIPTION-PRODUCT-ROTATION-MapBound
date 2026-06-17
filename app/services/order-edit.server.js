@@ -186,7 +186,7 @@ function lineTotal(li) {
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 
-export async function performOrderEdit({ admin, orderGid, targetLineItems, nextItem, currency }) {
+export async function performOrderEdit({ admin, orderGid, targetLineItems, nextItem, currency, freeRotation = false }) {
   // ── 1. Case 1 vs Case 2 ────────────────────────────────────────────────────
   const nextVariants = await getProductVariants(admin, nextItem.productId);
   const nextVariantTitleMap = new Map(nextVariants.map((v) => [v.title, v]));
@@ -256,13 +256,15 @@ export async function performOrderEdit({ admin, orderGid, targetLineItems, nextI
         await addVariant(admin, calcOrderId, variantId, 1);
 
       const variantCents  = Math.round(unitPrice * 100);
-      const discountCents = variantCents - unitCents;
+      // freeRotation=true → 100% discount (full variant price); otherwise match what customer paid
+      const discountCents = freeRotation ? variantCents : variantCents - unitCents;
       const discountAmt   = discountCents / 100;
 
       console.log(
         `[order-edit] ${title} unit=${i+1}/${targetLineItem.quantity} ` +
         `paidPrice=${(unitCents/100).toFixed(2)} variantPrice=${unitPrice.toFixed(2)} ` +
-        `discount=${discountAmt.toFixed(4)} currency=${variantCurrency ?? currency}`
+        `discount=${discountAmt.toFixed(4)} currency=${variantCurrency ?? currency}` +
+        (freeRotation ? " [FREE]" : "")
       );
 
       if (discountAmt > 0) {
