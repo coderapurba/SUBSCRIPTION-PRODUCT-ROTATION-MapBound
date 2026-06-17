@@ -219,19 +219,42 @@ async function rotateOrderItems(shop, orderGid, instance, group, targetLineItems
         // Zero-out detected another run already modified the order — that run will commit.
         console.log(`[rotation] order=${orderGid} skipped — concurrent run has the lock`);
       } else {
-        // Commit was rejected — could be a genuine concurrent conflict (one run succeeds,
-        // others hit this) OR the order is no longer editable (fulfilled, archived, etc.).
-        // Before logging FAILED, check if another concurrent run already succeeded for
-        // this order — if so, the rotation is fine and we just skip silently.
+        // Commit rejected — could be concurrent conflict OR order was fulfilled before
+        // we could commit (Shopify rejects removal of fulfilled line items).
         console.warn(`[rotation] order=${orderGid} commit failed — ${err.message}`);
+
+        // Check if another concurrent run already succeeded
         const anotherRunSucceeded = await db.rotationLog.findFirst({
           where: { shop, orderId: orderGid, status: "SUCCESS" },
         });
         if (anotherRunSucceeded) {
-          console.log(`[rotation] order=${orderGid} commit failed but another run already succeeded — skipping FAILED log`);
+          console.log(`[rotation] order=${orderGid} commit failed but another run already succeeded — skipping`);
         } else {
-          await writeLog(shop, orderGid, instance, nextItem, group, "FAILED",
-            `Order edit rejected by Shopify (may be fulfilled/archived): ${err.message}`);
+          // No other run succeeded. The order was likely fulfilled before our edit committed.
+          // Retry as additive edit: add rotation product without removing the fulfilled original.
+          // Customer gets both products; Digital Downloads will fulfill the new item automatically.
+          console.log(`[rotation] order=${orderGid} retrying as additive edit (order may be fulfilled)`);
+          try {
+            await performOrderEdit({
+              admin, orderGid, targetLineItems, nextItem, currency,
+              freeRotation: group.freeRotation ?? false,
+              keepTargetProduct: false,
+              skipZeroOut: true,
+            });
+            await db.subscriptionInstance.update({ where: { id: instance.id }, data: { currentIndex: newIndex } });
+            await writeLog(shop, orderGid, instance, nextItem, group, "SUCCESS",
+              "Additive rotation — product added alongside fulfilled original");
+            console.log(`[rotation] order=${orderGid} additive edit succeeded`);
+          } catch (retryErr) {
+            console.warn(`[rotation] order=${orderGid} additive retry also failed: ${retryErr.message}`);
+            const nowSucceeded = await db.rotationLog.findFirst({
+              where: { shop, orderId: orderGid, status: "SUCCESS" },
+            });
+            if (!nowSucceeded) {
+              await writeLog(shop, orderGid, instance, nextItem, group, "FAILED",
+                `Both edit attempts failed: ${retryErr.message}`);
+            }
+          }
         }
       }
       return;

@@ -208,7 +208,7 @@ function lineTotal(li) {
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 
-export async function performOrderEdit({ admin, orderGid, targetLineItems, nextItem, currency, freeRotation = false, keepTargetProduct = false }) {
+export async function performOrderEdit({ admin, orderGid, targetLineItems, nextItem, currency, freeRotation = false, keepTargetProduct = false, skipZeroOut = false }) {
   // ── 1. Case 1 vs Case 2 ────────────────────────────────────────────────────
   const nextVariants = await getProductVariants(admin, nextItem.productId);
   const nextVariantTitleMap = new Map(nextVariants.map((v) => [v.title, v]));
@@ -239,28 +239,30 @@ export async function performOrderEdit({ admin, orderGid, targetLineItems, nextI
   }
 
   // ── 3. Zero-out every target line item ────────────────────────────────────
-  // Always done — even when keepTargetProduct=true — because modifying an
-  // existing line item is the only way to make concurrent calculated-order
-  // commits conflict. Pure additive edits (no quantity changes) do NOT conflict,
-  // so skipping zero-out lets two simultaneous webhook deliveries both commit
-  // and add double the rotation items. When keepTargetProduct=true the item is
-  // re-added in step 4b after the rotation product is inserted.
-  for (const li of targetLineItems) {
-    const numericVariantId = String(li.variant_id);
-    const calcLineItemId = calcLineItemByVariantId.get(numericVariantId);
+  // Skipped on additive retry (skipZeroOut=true) — Shopify allows adding items
+  // to a fulfilled order but rejects removing fulfilled line items. When the
+  // order was already fulfilled before our webhook ran, we skip removal and
+  // just add the rotation product alongside the original.
+  if (!skipZeroOut) {
+    for (const li of targetLineItems) {
+      const numericVariantId = String(li.variant_id);
+      const calcLineItemId = calcLineItemByVariantId.get(numericVariantId);
 
-    if (!calcLineItemId) {
-      console.warn(`[order-edit] no CalculatedLineItem found for variant_id=${numericVariantId}, skipping`);
-      continue;
-    }
+      if (!calcLineItemId) {
+        console.warn(`[order-edit] no CalculatedLineItem found for variant_id=${numericVariantId}, skipping`);
+        continue;
+      }
 
-    console.log(`[order-edit] zeroing variant_id=${numericVariantId} calcLineItemId=${calcLineItemId}`);
-    const zeroed = await setLineItemQuantity(admin, calcOrderId, calcLineItemId, 0);
-    if (!zeroed) {
-      const err = new Error("Order already processed by concurrent webhook run");
-      err.concurrent = true;
-      throw err;
+      console.log(`[order-edit] zeroing variant_id=${numericVariantId} calcLineItemId=${calcLineItemId}`);
+      const zeroed = await setLineItemQuantity(admin, calcOrderId, calcLineItemId, 0);
+      if (!zeroed) {
+        const err = new Error("Order already processed by concurrent webhook run");
+        err.concurrent = true;
+        throw err;
+      }
     }
+  } else {
+    console.log(`[order-edit] skipZeroOut=true — additive edit, keeping existing fulfilled items`);
   }
 
   // ── 4. Add rotation items with correct pricing ────────────────────────────
@@ -320,9 +322,9 @@ export async function performOrderEdit({ admin, orderGid, targetLineItems, nextI
   }
 
   // ── 4b. Re-add target items when keepTargetProduct=true ──────────────────
-  // The zero-out in step 3 removed them; add them back at the original price
-  // so the subscription product remains in the order alongside the rotation product.
-  if (keepTargetProduct) {
+  // Only applies when we did the zero-out. On additive retry (skipZeroOut=true)
+  // the original items were never removed so there's nothing to re-add.
+  if (keepTargetProduct && !skipZeroOut) {
     console.log(`[order-edit] keepTargetProduct=true — re-adding ${targetLineItems.length} target item(s) at original price`);
     for (const li of targetLineItems) {
       const targetVariantGid = `gid://shopify/ProductVariant/${li.variant_id}`;
