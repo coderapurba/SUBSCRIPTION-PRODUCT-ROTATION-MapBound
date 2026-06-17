@@ -81,6 +81,21 @@ export const action = async ({ request, params }) => {
     return { success: "Group settings saved." };
   }
 
+  if (intent === "changeTargetProduct") {
+    const productId    = fd.get("productId")?.toString().trim();
+    const productTitle = fd.get("productTitle")?.toString().trim();
+    if (!productId || !productTitle) return { changeError: "Select a product." };
+    const conflict = await db.rotationGroup.findFirst({
+      where: { shop, targetProductId: productId, NOT: { id: params.id } },
+    });
+    if (conflict) return { changeError: `A rotation group for "${productTitle}" already exists.` };
+    await db.rotationGroup.updateMany({
+      where: { id: params.id, shop },
+      data: { targetProductId: productId, targetProductTitle: productTitle },
+    });
+    return redirect(`/app/rotation-groups/${params.id}`);
+  }
+
   if (intent === "deleteGroup") {
     await db.rotationGroup.deleteMany({ where: { id: params.id, shop } });
     return redirect("/app/rotation-groups");
@@ -193,6 +208,7 @@ function GroupSettingsSection({ group }) {
   const fetcher = useFetcher();
   const [isActive, setIsActive] = useState(group.isActive);
   const [showDeleteModal, setShowDeleteModal] = useState(false);
+  const [isChangingTarget, setIsChangingTarget] = useState(false);
   const isBusy = fetcher.state !== "idle";
 
   return (
@@ -221,18 +237,31 @@ function GroupSettingsSection({ group }) {
       <div style={{ display: "flex", flexDirection: "column", gap: "20px" }}>
         {/* Target product info */}
         <div style={{ background: "#f6f6f7", borderRadius: "8px", padding: "14px 16px" }}>
-          <div style={{ fontSize: "11px", fontWeight: "600", color: "#6d7175", textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: "10px" }}>Target Product</div>
-          <div style={{ display: "flex", alignItems: "center", gap: "14px" }}>
-            {group.targetProductImage ? (
-              <img src={group.targetProductImage} alt={group.targetProductTitle} style={targetThumb} />
-            ) : (
-              <div style={{ ...targetThumb, background: "#e1e3e5", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "22px" }}>📦</div>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "10px" }}>
+            <div style={{ fontSize: "11px", fontWeight: "600", color: "#6d7175", textTransform: "uppercase", letterSpacing: "0.5px" }}>Target Product</div>
+            {!isChangingTarget && (
+              <button type="button" onClick={() => setIsChangingTarget(true)} style={smallSecBtn}>Change</button>
             )}
-            <div>
-              <div style={{ fontSize: "15px", fontWeight: "600", color: "#303030", marginBottom: "3px" }}>{group.targetProductTitle}</div>
-              <div style={{ fontFamily: "monospace", fontSize: "11px", color: "#8c9196" }}>{group.targetProductId}</div>
-            </div>
           </div>
+
+          {!isChangingTarget ? (
+            <div style={{ display: "flex", alignItems: "center", gap: "14px" }}>
+              {group.targetProductImage ? (
+                <img src={group.targetProductImage} alt={group.targetProductTitle} style={targetThumb} />
+              ) : (
+                <div style={{ ...targetThumb, background: "#e1e3e5", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "22px" }}>📦</div>
+              )}
+              <div>
+                <div style={{ fontSize: "15px", fontWeight: "600", color: "#303030", marginBottom: "3px" }}>{group.targetProductTitle}</div>
+                <div style={{ fontFamily: "monospace", fontSize: "11px", color: "#8c9196" }}>{group.targetProductId}</div>
+              </div>
+            </div>
+          ) : (
+            <ChangeTargetForm
+              currentProductId={group.targetProductId}
+              onCancel={() => setIsChangingTarget(false)}
+            />
+          )}
         </div>
 
         {/* Status toggle */}
@@ -593,6 +622,112 @@ function AddItemForm() {
   );
 }
 
+// ─── Change Target Product Form ───────────────────────────────────────────────
+
+function ChangeTargetForm({ currentProductId, onCancel }) {
+  const fetcher = useFetcher();
+  const [query, setQuery] = useState("");
+  const [selectedProduct, setSelectedProduct] = useState(null);
+
+  const searchResults = (fetcher.data?.searchProducts ?? []).filter((p) => p.id !== currentProductId);
+  const isSearching = fetcher.state === "loading";
+  const isSaving    = fetcher.state === "submitting";
+
+  function handleSearch(value) {
+    setQuery(value);
+    setSelectedProduct(null);
+    if (value.length >= 2) fetcher.load(`?q=${encodeURIComponent(value)}`);
+  }
+
+  function handleSave() {
+    if (!selectedProduct) return;
+    fetcher.submit(
+      { intent: "changeTargetProduct", productId: selectedProduct.id, productTitle: selectedProduct.title },
+      { method: "post" },
+    );
+  }
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
+      {fetcher.data?.changeError && (
+        <div style={errorBanner}>{fetcher.data.changeError}</div>
+      )}
+
+      {/* Search input */}
+      <div>
+        <label style={labelStyle}>Search new target product</label>
+        <div style={{ display: "flex", gap: "8px" }}>
+          <input
+            type="text"
+            value={query}
+            onChange={(e) => handleSearch(e.target.value)}
+            placeholder="Type product name to search…"
+            style={{ ...inputStyle, flex: 1 }}
+            autoComplete="off"
+          />
+          {isSearching && (
+            <div style={{ display: "flex", alignItems: "center", fontSize: "12px", color: "#6d7175", whiteSpace: "nowrap" }}>Searching…</div>
+          )}
+          {query && !selectedProduct && (
+            <button type="button" onClick={() => { setQuery(""); setSelectedProduct(null); }} style={smallSecBtn}>✕</button>
+          )}
+        </div>
+      </div>
+
+      {/* Search results */}
+      {searchResults.length > 0 && !selectedProduct && (
+        <div style={resultsListStyle}>
+          <div style={{ fontSize: "11px", color: "#6d7175", fontWeight: "600", textTransform: "uppercase", letterSpacing: "0.4px", padding: "8px 14px 4px", borderBottom: "1px solid #f1f2f3" }}>
+            {searchResults.length} product{searchResults.length !== 1 ? "s" : ""} found — click to select
+          </div>
+          {searchResults.map((p) => (
+            <div
+              key={p.id}
+              onClick={() => { setSelectedProduct(p); setQuery(p.title); }}
+              style={dropItemBase}
+              onMouseEnter={(e) => (e.currentTarget.style.background = "#f3f4f6")}
+              onMouseLeave={(e) => (e.currentTarget.style.background = "#fff")}
+            >
+              {p.featuredImage
+                ? <img src={p.featuredImage.url} alt="" style={dropThumb} />
+                : <div style={{ ...dropThumb, background: "#f1f2f3", display: "flex", alignItems: "center", justifyContent: "center" }}>📦</div>
+              }
+              <div>
+                <div style={{ fontSize: "13px", fontWeight: "500", color: "#303030" }}>{p.title}</div>
+                <div style={{ fontSize: "11px", color: "#8c9196" }}>{p.variants?.nodes?.length ?? 0} variants</div>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Selected preview + save */}
+      {selectedProduct ? (
+        <div style={selectedPreview}>
+          <div style={{ display: "flex", alignItems: "center", gap: "12px", flex: 1 }}>
+            {selectedProduct.featuredImage
+              ? <img src={selectedProduct.featuredImage.url} alt="" style={previewThumb} />
+              : <div style={{ ...previewThumb, background: "#f1f2f3", display: "flex", alignItems: "center", justifyContent: "center" }}>📦</div>
+            }
+            <div>
+              <div style={{ fontSize: "14px", fontWeight: "600", color: "#303030" }}>{selectedProduct.title}</div>
+              <div style={{ fontSize: "12px", color: "#6d7175", marginTop: "2px" }}>New target product</div>
+            </div>
+          </div>
+          <div style={{ display: "flex", gap: "8px", flexShrink: 0 }}>
+            <button type="button" onClick={handleSave} disabled={isSaving} style={isSaving ? { ...addBtn, opacity: 0.7 } : addBtn}>
+              {isSaving ? "Saving…" : "Save Target"}
+            </button>
+            <button type="button" onClick={() => { setSelectedProduct(null); setQuery(""); }} style={smallSecBtn}>Clear</button>
+          </div>
+        </div>
+      ) : (
+        <button type="button" onClick={onCancel} style={smallSecBtn}>Cancel</button>
+      )}
+    </div>
+  );
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function InfoRow({ label, value }) {
@@ -641,6 +776,7 @@ const selectedPreview = { display: "flex", alignItems: "center", justifyContent:
 const previewThumb = { width: "48px", height: "48px", objectFit: "cover", borderRadius: "6px", border: "1px solid #e1e3e5", flexShrink: 0 };
 
 const successBanner = { background: "#e3f5e9", color: "#008060", border: "1px solid #b3dfcc", borderRadius: "8px", padding: "10px 14px", fontSize: "13px", marginBottom: "16px" };
+const errorBanner   = { background: "#fff4f4", color: "#d82c0d", border: "1px solid #f5c6c2", borderRadius: "8px", padding: "10px 14px", fontSize: "13px" };
 const codeStyle = { fontSize: "11px", background: "#f6f6f7", padding: "2px 6px", borderRadius: "4px", fontFamily: "monospace", wordBreak: "break-all" };
 
 // ─── Modal styles ─────────────────────────────────────────────────────────────
