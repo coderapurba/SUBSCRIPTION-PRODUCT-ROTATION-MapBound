@@ -44,6 +44,7 @@ model RotationGroup {
   targetProductTitle String
   isActive           Boolean  @default(true)
   freeRotation       Boolean  @default(false)
+  keepTargetProduct  Boolean  @default(false)
   createdAt          DateTime @default(now())
   updatedAt          DateTime @updatedAt
 

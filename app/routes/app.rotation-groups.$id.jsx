@@ -76,9 +76,10 @@ export const action = async ({ request, params }) => {
   const intent = fd.get("intent");
 
   if (intent === "updateGroup") {
-    const isActive     = fd.get("isActive") === "true";
-    const freeRotation = fd.get("freeRotation") === "true";
-    await db.rotationGroup.updateMany({ where: { id: params.id, shop }, data: { isActive, freeRotation } });
+    const isActive          = fd.get("isActive") === "true";
+    const freeRotation      = fd.get("freeRotation") === "true";
+    const keepTargetProduct = fd.get("keepTargetProduct") === "true";
+    await db.rotationGroup.updateMany({ where: { id: params.id, shop }, data: { isActive, freeRotation, keepTargetProduct } });
     return { success: "Group settings saved." };
   }
 
@@ -209,6 +210,7 @@ function GroupSettingsSection({ group }) {
   const fetcher = useFetcher();
   const [isActive, setIsActive] = useState(group.isActive);
   const [freeRotation, setFreeRotation] = useState(group.freeRotation ?? false);
+  const [keepTargetProduct, setKeepTargetProduct] = useState(group.keepTargetProduct ?? false);
   const [showDeleteModal, setShowDeleteModal] = useState(false);
   const [isChangingTarget, setIsChangingTarget] = useState(false);
   const isBusy = fetcher.state !== "idle";
@@ -324,11 +326,57 @@ function GroupSettingsSection({ group }) {
           </div>
         </div>
 
+        {/* Keep target product toggle */}
+        <div
+          onClick={() => setKeepTargetProduct(!keepTargetProduct)}
+          style={{
+            display: "flex", alignItems: "center", justifyContent: "space-between", gap: "16px",
+            padding: "14px 16px", borderRadius: "8px", cursor: "pointer",
+            border: `1.5px solid ${keepTargetProduct ? "#008060" : "#e1e3e5"}`,
+            background: keepTargetProduct ? "#f0faf6" : "#fafafa",
+            transition: "all 0.18s",
+          }}
+        >
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "3px" }}>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke={keepTargetProduct ? "#008060" : "#6d7175"} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
+                <rect x="2" y="3" width="20" height="14" rx="2"/>
+                <path d="M8 21h8M12 17v4"/>
+              </svg>
+              <span style={{ fontSize: "13px", fontWeight: "600", color: "#303030" }}>Keep Subscription Product</span>
+              {keepTargetProduct && (
+                <span style={{ fontSize: "10px", fontWeight: "700", color: "#008060", background: "#c9f0e1", padding: "2px 7px", borderRadius: "10px", letterSpacing: "0.4px", textTransform: "uppercase" }}>ON</span>
+              )}
+            </div>
+            <div style={{ fontSize: "12px", color: "#6d7175", lineHeight: "1.5", paddingLeft: "24px" }}>
+              {keepTargetProduct
+                ? "The original subscription product stays in the order; rotation product is added alongside it."
+                : "The original subscription product is replaced by the rotation product."}
+            </div>
+          </div>
+
+          {/* iOS-style toggle switch */}
+          <div style={{
+            position: "relative", width: "44px", height: "26px", borderRadius: "13px", flexShrink: 0,
+            background: keepTargetProduct ? "#008060" : "#c9cccf",
+            transition: "background 0.2s",
+          }}>
+            <div style={{
+              position: "absolute", top: "3px",
+              left: keepTargetProduct ? "21px" : "3px",
+              width: "20px", height: "20px", borderRadius: "50%",
+              background: "#fff",
+              boxShadow: "0 1px 4px rgba(0,0,0,0.25)",
+              transition: "left 0.2s",
+            }} />
+          </div>
+        </div>
+
         {/* Action buttons */}
         <div style={{ display: "flex", gap: "10px", paddingTop: "4px" }}>
           <button
             type="button"
-            onClick={() => fetcher.submit({ intent: "updateGroup", isActive: isActive.toString(), freeRotation: freeRotation.toString() }, { method: "post" })}
+            onClick={() => fetcher.submit({ intent: "updateGroup", isActive: isActive.toString(), freeRotation: freeRotation.toString(), keepTargetProduct: keepTargetProduct.toString() }, { method: "post" })}
             disabled={isBusy}
             style={isBusy ? { ...primaryBtn, opacity: 0.7 } : primaryBtn}
           >

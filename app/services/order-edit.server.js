@@ -186,7 +186,7 @@ function lineTotal(li) {
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 
-export async function performOrderEdit({ admin, orderGid, targetLineItems, nextItem, currency, freeRotation = false }) {
+export async function performOrderEdit({ admin, orderGid, targetLineItems, nextItem, currency, freeRotation = false, keepTargetProduct = false }) {
   // ── 1. Case 1 vs Case 2 ────────────────────────────────────────────────────
   const nextVariants = await getProductVariants(admin, nextItem.productId);
   const nextVariantTitleMap = new Map(nextVariants.map((v) => [v.title, v]));
@@ -212,22 +212,26 @@ export async function performOrderEdit({ admin, orderGid, targetLineItems, nextI
     if (numericVariantId) calcLineItemByVariantId.set(numericVariantId, cli.id);
   }
 
-  // ── 3. Zero-out every target line item ────────────────────────────────────
-  for (const li of targetLineItems) {
-    const numericVariantId = String(li.variant_id);
-    const calcLineItemId = calcLineItemByVariantId.get(numericVariantId);
+  // ── 3. Zero-out every target line item (skipped when keepTargetProduct=true) ──
+  if (keepTargetProduct) {
+    console.log(`[order-edit] keepTargetProduct=true — skipping zero-out, subscription product stays in order`);
+  } else {
+    for (const li of targetLineItems) {
+      const numericVariantId = String(li.variant_id);
+      const calcLineItemId = calcLineItemByVariantId.get(numericVariantId);
 
-    if (!calcLineItemId) {
-      console.warn(`[order-edit] no CalculatedLineItem found for variant_id=${numericVariantId}, skipping`);
-      continue;
-    }
+      if (!calcLineItemId) {
+        console.warn(`[order-edit] no CalculatedLineItem found for variant_id=${numericVariantId}, skipping`);
+        continue;
+      }
 
-    console.log(`[order-edit] zeroing variant_id=${numericVariantId} calcLineItemId=${calcLineItemId}`);
-    const zeroed = await setLineItemQuantity(admin, calcOrderId, calcLineItemId, 0);
-    if (!zeroed) {
-      const err = new Error("Order already processed by concurrent webhook run");
-      err.concurrent = true;
-      throw err;
+      console.log(`[order-edit] zeroing variant_id=${numericVariantId} calcLineItemId=${calcLineItemId}`);
+      const zeroed = await setLineItemQuantity(admin, calcOrderId, calcLineItemId, 0);
+      if (!zeroed) {
+        const err = new Error("Order already processed by concurrent webhook run");
+        err.concurrent = true;
+        throw err;
+      }
     }
   }
 
