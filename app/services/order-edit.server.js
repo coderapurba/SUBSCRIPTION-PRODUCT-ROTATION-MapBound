@@ -26,13 +26,13 @@ async function getProductVariants(admin, productId) {
 
 async function unarchiveOrder(admin, orderId) {
   const data = await gql(admin, `
-    mutation OrderOpen($id: ID!) {
-      orderOpen(id: $id) {
+    mutation OrderOpen($input: OrderOpenInput!) {
+      orderOpen(input: $input) {
         order { id }
         userErrors { field message }
       }
     }
-  `, { id: orderId });
+  `, { input: { id: orderId } });
 
   const errors = data?.data?.orderOpen?.userErrors;
   if (errors?.length) {
