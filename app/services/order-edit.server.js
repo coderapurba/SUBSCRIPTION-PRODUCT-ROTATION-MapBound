@@ -212,26 +212,28 @@ export async function performOrderEdit({ admin, orderGid, targetLineItems, nextI
     if (numericVariantId) calcLineItemByVariantId.set(numericVariantId, cli.id);
   }
 
-  // ── 3. Zero-out every target line item (skipped when keepTargetProduct=true) ──
-  if (keepTargetProduct) {
-    console.log(`[order-edit] keepTargetProduct=true — skipping zero-out, subscription product stays in order`);
-  } else {
-    for (const li of targetLineItems) {
-      const numericVariantId = String(li.variant_id);
-      const calcLineItemId = calcLineItemByVariantId.get(numericVariantId);
+  // ── 3. Zero-out every target line item ────────────────────────────────────
+  // Always done — even when keepTargetProduct=true — because modifying an
+  // existing line item is the only way to make concurrent calculated-order
+  // commits conflict. Pure additive edits (no quantity changes) do NOT conflict,
+  // so skipping zero-out lets two simultaneous webhook deliveries both commit
+  // and add double the rotation items. When keepTargetProduct=true the item is
+  // re-added in step 4b after the rotation product is inserted.
+  for (const li of targetLineItems) {
+    const numericVariantId = String(li.variant_id);
+    const calcLineItemId = calcLineItemByVariantId.get(numericVariantId);
 
-      if (!calcLineItemId) {
-        console.warn(`[order-edit] no CalculatedLineItem found for variant_id=${numericVariantId}, skipping`);
-        continue;
-      }
+    if (!calcLineItemId) {
+      console.warn(`[order-edit] no CalculatedLineItem found for variant_id=${numericVariantId}, skipping`);
+      continue;
+    }
 
-      console.log(`[order-edit] zeroing variant_id=${numericVariantId} calcLineItemId=${calcLineItemId}`);
-      const zeroed = await setLineItemQuantity(admin, calcOrderId, calcLineItemId, 0);
-      if (!zeroed) {
-        const err = new Error("Order already processed by concurrent webhook run");
-        err.concurrent = true;
-        throw err;
-      }
+    console.log(`[order-edit] zeroing variant_id=${numericVariantId} calcLineItemId=${calcLineItemId}`);
+    const zeroed = await setLineItemQuantity(admin, calcOrderId, calcLineItemId, 0);
+    if (!zeroed) {
+      const err = new Error("Order already processed by concurrent webhook run");
+      err.concurrent = true;
+      throw err;
     }
   }
 
@@ -245,7 +247,9 @@ export async function performOrderEdit({ admin, orderGid, targetLineItems, nextI
   // 1-cent remainder to the last unit so the line total is always exact.
   // Uses integer-cent arithmetic throughout to avoid floating-point drift.
 
-  async function addUnitsExact(variantId, targetLineItem, title) {
+  // free=true  → 100% discount (rotation product when freeRotation is on)
+  // free=false → price-match what customer paid (rotation product normally, or re-added target)
+  async function addUnitsExact(variantId, targetLineItem, title, free = freeRotation) {
     const totalCents    = Math.round(lineTotal(targetLineItem) * 100);
     const baseUnitCents = Math.floor(totalCents / targetLineItem.quantity);
 
@@ -253,22 +257,18 @@ export async function performOrderEdit({ admin, orderGid, targetLineItems, nextI
       const isLast    = i === targetLineItem.quantity - 1;
       const unitCents = isLast ? totalCents - baseUnitCents * i : baseUnitCents;
 
-      // Add the variant first, then read back its actual price in the order's
-      // presentment currency — avoids currency mismatch when order currency
-      // (e.g. USD via Loop) differs from the store's base currency (e.g. AUD).
       const { id: newId, unitPrice, currencyCode: variantCurrency } =
         await addVariant(admin, calcOrderId, variantId, 1);
 
       const variantCents  = Math.round(unitPrice * 100);
-      // freeRotation=true → 100% discount (full variant price); otherwise match what customer paid
-      const discountCents = freeRotation ? variantCents : variantCents - unitCents;
+      const discountCents = free ? variantCents : variantCents - unitCents;
       const discountAmt   = discountCents / 100;
 
       console.log(
         `[order-edit] ${title} unit=${i+1}/${targetLineItem.quantity} ` +
         `paidPrice=${(unitCents/100).toFixed(2)} variantPrice=${unitPrice.toFixed(2)} ` +
         `discount=${discountAmt.toFixed(4)} currency=${variantCurrency ?? currency}` +
-        (freeRotation ? " [FREE]" : "")
+        (free ? " [FREE]" : "")
       );
 
       if (discountAmt > 0) {
@@ -290,6 +290,17 @@ export async function performOrderEdit({ admin, orderGid, targetLineItems, nextI
     // Case 1: rotation product uses its default variant
     for (const li of targetLineItems) {
       await addUnitsExact(nextItem.variantId, li, `case1`);
+    }
+  }
+
+  // ── 4b. Re-add target items when keepTargetProduct=true ──────────────────
+  // The zero-out in step 3 removed them; add them back at the original price
+  // so the subscription product remains in the order alongside the rotation product.
+  if (keepTargetProduct) {
+    console.log(`[order-edit] keepTargetProduct=true — re-adding ${targetLineItems.length} target item(s) at original price`);
+    for (const li of targetLineItems) {
+      const targetVariantGid = `gid://shopify/ProductVariant/${li.variant_id}`;
+      await addUnitsExact(targetVariantGid, li, `reAdd variant=${li.variant_title || "Default"}`, false);
     }
   }
 
