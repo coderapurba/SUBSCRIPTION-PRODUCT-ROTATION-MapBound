@@ -24,6 +24,25 @@ async function getProductVariants(admin, productId) {
   return data?.data?.product?.variants?.nodes ?? [];
 }
 
+async function unarchiveOrder(admin, orderId) {
+  const data = await gql(admin, `
+    mutation OrderOpen($id: ID!) {
+      orderOpen(id: $id) {
+        order { id }
+        userErrors { field message }
+      }
+    }
+  `, { id: orderId });
+
+  const errors = data?.data?.orderOpen?.userErrors;
+  if (errors?.length) {
+    // Not fatal — order may already be open
+    console.log(`[order-edit] orderOpen (may already be open): ${errors[0].message}`);
+  } else {
+    console.log(`[order-edit] orderOpen succeeded for ${orderId}`);
+  }
+}
+
 async function beginOrderEdit(admin, orderId) {
   const data = await gql(admin, `
     mutation OrderEditBegin($id: ID!) {
@@ -146,8 +165,11 @@ async function commitOrderEdit(admin, calcOrderId) {
   const errors = data?.data?.orderEditCommit?.userErrors;
   if (errors?.length) {
     const msg = errors[0].message;
-    // "Could not save the order edit" means a concurrent webhook run already committed
-    // a conflicting edit for this order — the rotation succeeded via that run, so skip.
+    console.warn(`[order-edit] commitOrderEdit failed: ${msg}`);
+    // "Could not save the order edit" can mean either:
+    //   a) concurrent run already committed → that run's edit stands (normal)
+    //   b) order is fulfilled/archived → edit is rejected by Shopify (needs visibility)
+    // We flag it concurrent so the caller can log it properly either way.
     if (msg.includes("Could not save the order edit")) {
       const err = new Error(`orderEditCommit: ${msg}`);
       err.concurrent = true;
@@ -199,6 +221,10 @@ export async function performOrderEdit({ admin, orderGid, targetLineItems, nextI
   console.log(`[order-edit] order=${orderGid} case=${allTitlesMatch ? "2 (variant match)" : "1 (default variant)"} targetLineItems=${targetLineItems.length}`);
 
   // ── 2. Begin edit ──────────────────────────────────────────────────────────
+  // Unarchive first — Digital Downloads (and similar apps) auto-fulfill and
+  // archive orders within milliseconds of payment. orderOpen is a no-op on
+  // already-open orders; it unblocks the edit on archived/fulfilled ones.
+  await unarchiveOrder(admin, orderGid);
   const { calcOrderId, calcLineItems } = await beginOrderEdit(admin, orderGid);
 
   console.log(`[order-edit] calcOrderId=${calcOrderId} calcLineItems=${calcLineItems.length}`);

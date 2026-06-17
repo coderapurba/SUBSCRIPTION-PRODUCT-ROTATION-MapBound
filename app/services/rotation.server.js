@@ -204,7 +204,17 @@ async function rotateOrderItems(shop, orderGid, instance, group, targetLineItems
     await writeLog(shop, orderGid, instance, nextItem, group, "SUCCESS");
   } catch (err) {
     if (err.concurrent) {
-      console.log(`[rotation] order=${orderGid} already processed by concurrent webhook, skipping`);
+      if (err.message.includes("Order already processed by concurrent webhook run")) {
+        // Zero-out detected another run already modified the order — that run will commit.
+        console.log(`[rotation] order=${orderGid} skipped — concurrent run has the lock`);
+      } else {
+        // Commit was rejected — could be a genuine concurrent conflict (one run succeeds,
+        // others hit this) OR the order is no longer editable (fulfilled, archived, etc.).
+        // Write a FAILED log so it appears in the Rotation Logs UI for investigation.
+        console.warn(`[rotation] order=${orderGid} commit failed — ${err.message}`);
+        await writeLog(shop, orderGid, instance, nextItem, group, "FAILED",
+          `Order edit rejected by Shopify (may be fulfilled/archived): ${err.message}`);
+      }
       return;
     }
     await writeLog(shop, orderGid, instance, nextItem, group, "FAILED", err.message);
