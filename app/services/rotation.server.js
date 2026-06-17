@@ -259,28 +259,31 @@ export async function processOrderWebhook(shop, order, admin) {
     }
 
     // ── Loop renewal order ────────────────────────────────────────────────────
-    const existingInstance = await findRenewalInstance(
+    let instance = await findRenewalInstance(
       shop, customerId, group.targetProductId, contractId, targetLineItems
     );
 
-    console.log(`[rotation] order=${orderId} sourceIsLoopRenewal=true existingInstance=${existingInstance?.id ?? "none"}`);
-
-    if (!existingInstance) {
-      // No matching instance — create one for this subscription and wait for next renewal
-      console.warn(`[rotation] order=${orderId} → renewal but no prior instance, creating`);
-      await createSubscriptionInstance(shop, orderId, customerId, contractId, group, targetLineItems);
-    } else {
-      const alreadyLogged = await db.rotationLog.findFirst({
-        where: { shop, orderId: orderGid, customerId: existingInstance.customerId },
-      });
-      if (alreadyLogged) {
-        console.log(`[rotation] order=${orderId} already processed, skipping duplicate`);
-        continue;
-      }
-
-      console.log(`[rotation] order=${orderId} → renewal, rotating instance=${existingInstance.id} index=${existingInstance.currentIndex} fingerprint=${existingInstance.lineItemFingerprint ?? "none"}`);
-      await rotateOrderItems(shop, orderGid, existingInstance, group, targetLineItems, currency, admin);
+    if (!instance) {
+      // No prior instance — customer subscribed before the app was installed.
+      // Create an instance now and rotate this renewal immediately (don't skip it).
+      // sourceIsLoopRenewal=true guarantees this is NOT a first purchase.
+      console.log(`[rotation] order=${orderId} → renewal, no prior instance (pre-install subscriber), creating and rotating`);
+      instance = await createSubscriptionInstance(shop, orderId, customerId, contractId, group, targetLineItems);
     }
+
+    console.log(`[rotation] order=${orderId} sourceIsLoopRenewal=true instance=${instance.id} index=${instance.currentIndex}`);
+
+    // Duplicate protection — handles sequential webhook retries after a successful run
+    const alreadyLogged = await db.rotationLog.findFirst({
+      where: { shop, orderId: orderGid, customerId: instance.customerId },
+    });
+    if (alreadyLogged) {
+      console.log(`[rotation] order=${orderId} already processed, skipping duplicate`);
+      continue;
+    }
+
+    console.log(`[rotation] order=${orderId} → rotating instance=${instance.id} index=${instance.currentIndex} fingerprint=${instance.lineItemFingerprint ?? "none"}`);
+    await rotateOrderItems(shop, orderGid, instance, group, targetLineItems, currency, admin);
   }
 
   pruneOldLogs(shop).catch((err) =>
