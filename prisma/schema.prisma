@@ -87,6 +87,7 @@ model SubscriptionInstance {
   subscriptionContractId String?
   targetProductId        String
   currentIndex           Int      @default(0)
+  lastProcessedOrderId   String?
   uniqueKey              String   @unique
   status                 String   @default("ACTIVE") // ACTIVE | PAUSED | CANCELLED
   rotationGroupId        String

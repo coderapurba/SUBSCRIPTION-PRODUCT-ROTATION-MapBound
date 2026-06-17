@@ -199,11 +199,15 @@ async function rotateOrderItems(shop, orderGid, instance, group, targetLineItems
 
   if (toNumericId(nextItem.productId) === toNumericId(group.targetProductId)) {
     const claimed = await db.subscriptionInstance.updateMany({
-      where: { id: instance.id, currentIndex: instance.currentIndex },
-      data: { currentIndex: newIndex },
+      where: {
+        id: instance.id,
+        currentIndex: instance.currentIndex,
+        OR: [{ lastProcessedOrderId: null }, { lastProcessedOrderId: { not: orderGid } }],
+      },
+      data: { currentIndex: newIndex, lastProcessedOrderId: orderGid },
     });
     if (claimed.count === 0) {
-      console.log(`[rotation] order=${orderGid} self-rotation slot already claimed by concurrent run`);
+      console.log(`[rotation] order=${orderGid} self-rotation slot already claimed by concurrent or sequential run`);
       return;
     }
     console.log(`[rotation] order=${orderGid} rotation item at index=${nextIndex} is the target product — skipping self-rotation, advancing index`);
@@ -212,14 +216,22 @@ async function rotateOrderItems(shop, orderGid, instance, group, targetLineItems
   }
 
   // ── Optimistic lock ────────────────────────────────────────────────────────
-  // Atomically advance currentIndex only if it still matches what we read.
-  // Exactly one concurrent run wins (count=1); all others see count=0 and bail.
-  // This is the primary concurrency gate — zero-out alone is insufficient because
-  // concurrent runs each get their own calculatedOrder from orderEditBegin, so
-  // additive edits (skipZeroOut=true) can all commit without any Shopify conflict.
+  // Atomically advance currentIndex AND record which order we're processing.
+  // Two conditions must both be true for a run to win:
+  //   1. currentIndex still matches what we read (prevents concurrent runs from
+  //      claiming the same slot from different webhook deliveries at the same time)
+  //   2. lastProcessedOrderId is different from this order (prevents sequential
+  //      webhook retries from claiming a DIFFERENT slot — Run 1 advances 0→1,
+  //      Run 2 arrives 7s later and would see index=1 and win slot 1→2 for the
+  //      same order. With lastProcessedOrderId, Run 2 loses because Run 1 already
+  //      stamped this order, even before writing the SUCCESS log.)
   const claimed = await db.subscriptionInstance.updateMany({
-    where: { id: instance.id, currentIndex: instance.currentIndex },
-    data: { currentIndex: newIndex },
+    where: {
+      id: instance.id,
+      currentIndex: instance.currentIndex,
+      OR: [{ lastProcessedOrderId: null }, { lastProcessedOrderId: { not: orderGid } }],
+    },
+    data: { currentIndex: newIndex, lastProcessedOrderId: orderGid },
   });
 
   if (claimed.count === 0) {
