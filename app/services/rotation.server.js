@@ -49,23 +49,34 @@ async function createSubscriptionInstance(shop, orderId, customerId, contractId,
   const uniqueKey = buildUniqueKey(shop, customerId, group.targetProductId, orderId);
   const fingerprint = buildLineItemFingerprint(targetLineItems);
 
-  // upsert is atomic — safe when Shopify delivers the same webhook twice concurrently
-  return db.subscriptionInstance.upsert({
-    where: { uniqueKey },
-    update: {},
-    create: {
-      shop,
-      customerId,
-      originalOrderId: orderId,
-      subscriptionContractId: contractId ?? null,
-      targetProductId: group.targetProductId,
-      currentIndex: 0,
-      uniqueKey,
-      lineItemFingerprint: fingerprint,
-      status: "ACTIVE",
-      rotationGroupId: group.id,
-    },
-  });
+  // upsert is not truly atomic in Prisma under concurrent writes — two simultaneous
+  // runs can both miss the existing record and both attempt create, causing P2002.
+  // Catch that and fall back to a plain findUnique.
+  try {
+    return await db.subscriptionInstance.upsert({
+      where: { uniqueKey },
+      update: {},
+      create: {
+        shop,
+        customerId,
+        originalOrderId: orderId,
+        subscriptionContractId: contractId ?? null,
+        targetProductId: group.targetProductId,
+        currentIndex: 0,
+        uniqueKey,
+        lineItemFingerprint: fingerprint,
+        status: "ACTIVE",
+        rotationGroupId: group.id,
+      },
+    });
+  } catch (err) {
+    if (err.code === "P2002") {
+      // Another concurrent run already created this instance — return it
+      const existing = await db.subscriptionInstance.findUnique({ where: { uniqueKey } });
+      if (existing) return existing;
+    }
+    throw err;
+  }
 }
 
 async function findRenewalInstance(shop, customerId, targetProductId, contractId, renewalLineItems) {
@@ -210,10 +221,18 @@ async function rotateOrderItems(shop, orderGid, instance, group, targetLineItems
       } else {
         // Commit was rejected — could be a genuine concurrent conflict (one run succeeds,
         // others hit this) OR the order is no longer editable (fulfilled, archived, etc.).
-        // Write a FAILED log so it appears in the Rotation Logs UI for investigation.
+        // Before logging FAILED, check if another concurrent run already succeeded for
+        // this order — if so, the rotation is fine and we just skip silently.
         console.warn(`[rotation] order=${orderGid} commit failed — ${err.message}`);
-        await writeLog(shop, orderGid, instance, nextItem, group, "FAILED",
-          `Order edit rejected by Shopify (may be fulfilled/archived): ${err.message}`);
+        const anotherRunSucceeded = await db.rotationLog.findFirst({
+          where: { shop, orderId: orderGid, status: "SUCCESS" },
+        });
+        if (anotherRunSucceeded) {
+          console.log(`[rotation] order=${orderGid} commit failed but another run already succeeded — skipping FAILED log`);
+        } else {
+          await writeLog(shop, orderGid, instance, nextItem, group, "FAILED",
+            `Order edit rejected by Shopify (may be fulfilled/archived): ${err.message}`);
+        }
       }
       return;
     }
