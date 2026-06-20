@@ -206,6 +206,74 @@ function lineTotal(li) {
   return linePrice - totalDiscount;
 }
 
+// ─── Auto-fulfill ─────────────────────────────────────────────────────────────
+
+export async function autoFulfillRotationItems(admin, orderGid, rotationProductId) {
+  const productGid = rotationProductId.startsWith("gid://")
+    ? rotationProductId
+    : `gid://shopify/Product/${rotationProductId}`;
+
+  const data = await gql(admin, `
+    query GetFulfillmentOrders($orderId: ID!) {
+      order(id: $orderId) {
+        fulfillmentOrders(first: 20) {
+          nodes {
+            id
+            status
+            lineItems(first: 50) {
+              nodes {
+                id
+                remainingQuantity
+                lineItem {
+                  variant { product { id } }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  `, { orderId: orderGid });
+
+  const fulfillmentOrders = data?.data?.order?.fulfillmentOrders?.nodes ?? [];
+
+  const toFulfill = [];
+  for (const fo of fulfillmentOrders) {
+    if (fo.status !== "OPEN") continue;
+    const matching = (fo.lineItems?.nodes ?? []).filter(
+      (li) => li.lineItem?.variant?.product?.id === productGid && li.remainingQuantity > 0
+    );
+    if (matching.length > 0) {
+      toFulfill.push({
+        fulfillmentOrderId: fo.id,
+        fulfillmentOrderLineItems: matching.map((li) => ({ id: li.id, quantity: li.remainingQuantity })),
+      });
+    }
+  }
+
+  if (toFulfill.length === 0) {
+    console.log(`[order-edit] autoFulfill: no open fulfillment order found for product=${productGid} on order=${orderGid}`);
+    return;
+  }
+
+  const fulfillData = await gql(admin, `
+    mutation FulfillmentCreate($fulfillment: FulfillmentV2Input!) {
+      fulfillmentCreateV2(fulfillment: $fulfillment) {
+        fulfillment { id status }
+        userErrors { field message }
+      }
+    }
+  `, { fulfillment: { lineItemsByFulfillmentOrder: toFulfill, notifyCustomer: false } });
+
+  const errors = fulfillData?.data?.fulfillmentCreateV2?.userErrors;
+  if (errors?.length) {
+    console.warn(`[order-edit] autoFulfill warning: ${errors[0].message}`);
+  } else {
+    const status = fulfillData?.data?.fulfillmentCreateV2?.fulfillment?.status;
+    console.log(`[order-edit] autoFulfill succeeded for order=${orderGid} status=${status}`);
+  }
+}
+
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 export async function performOrderEdit({ admin, orderGid, targetLineItems, nextItem, currency, freeRotation = false, keepTargetProduct = false, skipZeroOut = false }) {

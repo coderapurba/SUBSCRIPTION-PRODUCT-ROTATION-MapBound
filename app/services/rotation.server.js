@@ -8,7 +8,7 @@
  */
 
 import db from "../db.server.js";
-import { performOrderEdit } from "./order-edit.server.js";
+import { performOrderEdit, autoFulfillRotationItems } from "./order-edit.server.js";
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
 
@@ -247,6 +247,13 @@ async function rotateOrderItems(shop, orderGid, instance, group, targetLineItems
       freeRotation: group.freeRotation ?? false,
       keepTargetProduct: group.keepTargetProduct ?? false,
     });
+    if (group.autoFulfill) {
+      try {
+        await autoFulfillRotationItems(admin, orderGid, nextItem.productId);
+      } catch (fulfillErr) {
+        console.warn(`[rotation] order=${orderGid} autoFulfill error (non-fatal): ${fulfillErr.message}`);
+      }
+    }
     await writeLog(shop, orderGid, instance, nextItem, group, "SUCCESS");
   } catch (err) {
     if (err.concurrent) {
@@ -267,6 +274,13 @@ async function rotateOrderItems(shop, orderGid, instance, group, targetLineItems
             keepTargetProduct: false,
             skipZeroOut: true,
           });
+          if (group.autoFulfill) {
+            try {
+              await autoFulfillRotationItems(admin, orderGid, nextItem.productId);
+            } catch (fulfillErr) {
+              console.warn(`[rotation] order=${orderGid} autoFulfill error (non-fatal): ${fulfillErr.message}`);
+            }
+          }
           await writeLog(shop, orderGid, instance, nextItem, group, "SUCCESS",
             "Additive rotation — product added alongside fulfilled original");
           console.log(`[rotation] order=${orderGid} additive edit succeeded`);

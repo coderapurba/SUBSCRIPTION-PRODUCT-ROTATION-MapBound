@@ -46,6 +46,7 @@ model RotationGroup {
   isActive           Boolean  @default(true)
   freeRotation       Boolean  @default(false)
   keepTargetProduct  Boolean  @default(false)
+  autoFulfill        Boolean  @default(false)
   createdAt          DateTime @default(now())
   updatedAt          DateTime @updatedAt
 

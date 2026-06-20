@@ -45,6 +45,7 @@ model RotationGroup {
   isActive           Boolean  @default(true)
   freeRotation       Boolean  @default(false)
   keepTargetProduct  Boolean  @default(false)
+  autoFulfill        Boolean  @default(false)
   createdAt          DateTime @default(now())
   updatedAt          DateTime @updatedAt
 
@@ -89,6 +90,7 @@ model SubscriptionInstance {
   currentIndex           Int      @default(0)
   lastProcessedOrderId   String?
   uniqueKey              String   @unique
+  lineItemFingerprint    String?
   status                 String   @default("ACTIVE") // ACTIVE | PAUSED | CANCELLED
   rotationGroupId        String
   createdAt              DateTime @default(now())
