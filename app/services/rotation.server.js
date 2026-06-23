@@ -393,52 +393,63 @@ export async function fetchOrderForRotation(admin, orderNumericId) {
   };
 }
 
-// Collect the numeric productIds this subscription has ALREADY received, by reading the
-// subscription contract's own past orders. Scoped strictly to the contract, so one
-// customer's multiple subscriptions never bleed into each other. Works for both old
-// (pre-install) and new subscriptions because it reflects what Shopify actually shipped.
-// Returns an empty Set on any failure (so rotation falls back to normal index order).
-export async function getReceivedProductIdsForContract(admin, contractId, excludeOrderNumericId) {
-  try {
+// Fetch the customer's recent orders (light) for the "already received" skip check.
+// We use read_orders here instead of reading the Loop-owned SubscriptionContract — our
+// `read_own_subscription_contracts` scope can't read contracts another app created, so
+// subscriptionContract(id) returns null. Orders are always readable.
+async function fetchCustomerOrdersLight(admin, customerNumericId, max = 100) {
+  const orders = [];
+  let cursor = null;
+  while (orders.length < max) {
     const res = await admin.graphql(`
-      query ContractReceivedProducts($id: ID!) {
-        subscriptionContract(id: $id) {
-          id
-          orders(first: 100) {
-            nodes {
-              id
-              lineItems(first: 100) {
-                nodes { quantity product { id } }
-              }
-            }
+      query CustomerOrders($q: String!, $cursor: String) {
+        orders(first: 50, after: $cursor, query: $q, sortKey: CREATED_AT, reverse: true) {
+          pageInfo { hasNextPage endCursor }
+          nodes {
+            id
+            sourceName
+            lineItems(first: 100) { nodes { quantity product { id } } }
           }
         }
       }
-    `, { variables: { id: contractId } });
+    `, { variables: { q: `customer_id:${customerNumericId}`, cursor } });
 
     const data = await res.json();
-    const contract = data?.data?.subscriptionContract;
-    if (!contract) {
-      console.warn(`[rotation/flow] could not read subscriptionContract=${contractId} (scope/ownership?) — skipping the "already received" check`);
-      return new Set();
-    }
-
-    const received = new Set();
-    for (const o of contract.orders?.nodes ?? []) {
-      if (excludeOrderNumericId && toNumericId(o.id) === toNumericId(excludeOrderNumericId)) continue;
-      for (const li of o.lineItems?.nodes ?? []) {
-        if ((li.quantity ?? 0) <= 0) continue;
-        const pid = li.product?.id ? toNumericId(li.product.id) : null;
-        if (pid) received.add(pid);
-      }
-    }
-
-    console.log(`[rotation/flow] contract=${contractId} already-received products=[${[...received].join(", ") || "none"}]`);
-    return received;
-  } catch (err) {
-    console.warn(`[rotation/flow] received-products lookup failed for contract=${contractId}: ${err.message} — skipping the check`);
-    return new Set();
+    const conn = data?.data?.orders;
+    if (!conn) break;
+    orders.push(...(conn.nodes ?? []));
+    if (!conn.pageInfo?.hasNextPage) break;
+    cursor = conn.pageInfo.endCursor;
   }
+  return orders;
+}
+
+// From the customer's orders, collect the rotation-group products already received.
+// Scoped to subscription-related orders only — an order is counted if it is a Loop
+// renewal OR it contains the target subscription product — so unrelated standalone
+// purchases never suppress a rotation product. Returns numeric productIds.
+function receivedRotationProductIds(customerOrders, group, excludeOrderNumericId) {
+  const targetNumericId = toNumericId(group.targetProductId);
+  const rotationIds = new Set(group.rotationItems.map((it) => toNumericId(it.productId)));
+  const received = new Set();
+
+  for (const o of customerOrders) {
+    if (excludeOrderNumericId && toNumericId(o.id) === toNumericId(excludeOrderNumericId)) continue;
+
+    const items = o.lineItems?.nodes ?? [];
+    const containsTarget = items.some(
+      (li) => li.product?.id && toNumericId(li.product.id) === targetNumericId
+    );
+    const isRenewal = o.sourceName === "subscription_contract_checkout_one";
+    if (!containsTarget && !isRenewal) continue; // not subscription-related
+
+    for (const li of items) {
+      if ((li.quantity ?? 0) <= 0) continue;
+      const pid = li.product?.id ? toNumericId(li.product.id) : null;
+      if (pid && rotationIds.has(pid)) received.add(pid);
+    }
+  }
+  return received;
 }
 
 // Rotate a renewal order, routing strictly by subscription contract id.
@@ -466,9 +477,8 @@ export async function processRenewalForContract(shop, order, admin, contractId) 
     return;
   }
 
-  // Products this subscription already received (read from the contract's own orders).
-  // Fetched lazily once, only when we're actually about to rotate.
-  let receivedProductIds = null;
+  // The customer's orders, fetched lazily once, used for the "already received" skip.
+  let customerOrders = null;
 
   for (const group of groups) {
     const targetNumericId = toNumericId(group.targetProductId);
@@ -501,10 +511,14 @@ export async function processRenewalForContract(shop, order, admin, contractId) 
       continue;
     }
 
-    // Skip rotation products this subscription has already received (contract-scoped).
-    if (receivedProductIds === null) {
-      receivedProductIds = await getReceivedProductIdsForContract(admin, contractId, orderId);
+    // Skip rotation products this customer has already received in their subscription
+    // orders for this product (read from the customer's order history).
+    if (customerOrders === null) {
+      customerOrders = await fetchCustomerOrdersLight(admin, customerId);
+      console.log(`[rotation/flow] order=${orderId} fetched ${customerOrders.length} customer orders for the already-received check`);
     }
+    const receivedProductIds = receivedRotationProductIds(customerOrders, group, orderId);
+    console.log(`[rotation/flow] order=${orderId} group=${group.id} already-received rotation products=[${[...receivedProductIds].join(", ") || "none"}]`);
 
     console.log(`[rotation/flow] order=${orderId} → rotating instance=${instance.id} index=${instance.currentIndex}`);
     await rotateOrderItems(shop, orderGid, instance, group, targetLineItems, currency, admin, receivedProductIds);
