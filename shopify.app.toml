@@ -2,7 +2,7 @@
 # Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
 
 client_id = "df07ee6d17a8b6f7721ef1a4d462e9f4"
-application_url = "https://subscription-product-rotation.vercel.app"
+application_url = "https://subscription-product-rotation-vamor.vercel.app"
 embedded = true
 name = "Subscription Product Rotation"
 
@@ -62,10 +62,10 @@ api_version = "2026-07"
   topics = [ "subscription_contracts/update" ]
 
 [auth]
-redirect_urls = [ "https://subscription-product-rotation.vercel.app/api/auth", 
-"https://subscription-product-rotation.vercel.app/auth/callback",
- "https://subscription-product-rotation.vercel.app/auth/shopify/callback",
-  "https://subscription-product-rotation.vercel.app/api/auth/callback"
+redirect_urls = [ "https://subscription-product-rotation-vamor.vercel.app/api/auth", 
+"https://subscription-product-rotation-vamor.vercel.app/auth/callback",
+ "https://subscription-product-rotation-vamor.vercel.app/auth/shopify/callback",
+  "https://subscription-product-rotation-vamor.vercel.app/api/auth/callback"
  ]
 
 [build]

@@ -311,7 +311,11 @@ export async function performOrderEdit({ admin, orderGid, targetLineItems, nextI
   // to a fulfilled order but rejects removing fulfilled line items. When the
   // order was already fulfilled before our webhook ran, we skip removal and
   // just add the rotation product alongside the original.
-  if (!skipZeroOut) {
+  //
+  // Also skipped when keepTargetProduct=true — the merchant wants the original
+  // subscription product to STAY in the order untouched. We leave it in place
+  // and just add the rotation product alongside it (no remove + re-add churn).
+  if (!skipZeroOut && !keepTargetProduct) {
     for (const li of targetLineItems) {
       const numericVariantId = String(li.variant_id);
       const calcLineItemId = calcLineItemByVariantId.get(numericVariantId);
@@ -389,16 +393,12 @@ export async function performOrderEdit({ admin, orderGid, targetLineItems, nextI
     }
   }
 
-  // ── 4b. Re-add target items when keepTargetProduct=true ──────────────────
-  // Only applies when we did the zero-out. On additive retry (skipZeroOut=true)
-  // the original items were never removed so there's nothing to re-add.
-  if (keepTargetProduct && !skipZeroOut) {
-    console.log(`[order-edit] keepTargetProduct=true — re-adding ${targetLineItems.length} target item(s) at original price`);
-    for (const li of targetLineItems) {
-      const targetVariantGid = `gid://shopify/ProductVariant/${li.variant_id}`;
-      await addUnitsExact(targetVariantGid, li, `reAdd variant=${li.variant_title || "Default"}`, false);
-    }
-  }
+  // ── 4b. keepTargetProduct ────────────────────────────────────────────────
+  // No action needed: when keepTargetProduct=true the original line items were
+  // never zeroed out in step 3, so they remain in the order as-is. We only
+  // added the rotation product alongside them above. (Previously this branch
+  // re-added the target product after a zero-out, which caused the original to
+  // show as "Removed" and then re-added — unnecessary churn now eliminated.)
 
   // ── 5. Commit ──────────────────────────────────────────────────────────────
   await commitOrderEdit(admin, calcOrderId);

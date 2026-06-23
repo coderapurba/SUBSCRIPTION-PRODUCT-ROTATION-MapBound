@@ -2,7 +2,7 @@
 
 client_id = "d21e4070182feeed9f1e242a2bc24865"
 name = "Subs Product Rotation Vmra"
-application_url = "https://example.com"
+application_url = "https://subscription-product-rotation-vamor.vercel.app"
 embedded = true
 
 [access_scopes]
@@ -61,7 +61,11 @@ api_version = "2026-07"
   topics = [ "subscription_contracts/update" ]
 
 [auth]
-redirect_urls = [ "https://example.com/api/auth" ]
+redirect_urls = [ "https://subscription-product-rotation-vamor.vercel.app/api/auth", 
+"https://subscription-product-rotation-vamor.vercel.app/auth/callback",
+ "https://subscription-product-rotation-vamor.vercel.app/auth/shopify/callback",
+  "https://subscription-product-rotation-vamor.vercel.app/api/auth/callback"
+ ]
 
 [build]
 automatically_update_urls_on_dev = true
