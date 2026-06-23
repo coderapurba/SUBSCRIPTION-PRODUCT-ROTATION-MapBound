@@ -80,26 +80,65 @@ async function createSubscriptionInstance(shop, orderId, customerId, contractId,
 }
 
 async function findRenewalInstance(shop, customerId, targetProductId, contractId, renewalLineItems) {
-  // Primary: exact match by contract ID
+  // ── Priority 1: exact match by subscription contract id ─────────────────────
+  // The contract id is the subscription's true identity. Same contract id → same
+  // instance (continue its rotation). A renewal whose contract id has no instance is
+  // a DIFFERENT subscription and must get its own fresh instance — never another
+  // contract's instance.
   if (contractId) {
     const inst = await db.subscriptionInstance.findFirst({
       where: { shop, subscriptionContractId: contractId, targetProductId, status: "ACTIVE" },
     });
-    if (inst) return inst;
-    console.warn(`[rotation] No ACTIVE instance for contractId=${contractId}. Falling back to fingerprint lookup.`);
+    if (inst) {
+      console.log(`[rotation] customer=${customerId} matched instance=${inst.id} by contractId=${contractId}`);
+      return inst;
+    }
+    console.log(`[rotation] customer=${customerId} no instance for contractId=${contractId} — checking unlinked instances before treating as new`);
   }
 
   const renewalFingerprint = buildLineItemFingerprint(renewalLineItems);
 
-  const instances = await db.subscriptionInstance.findMany({
+  let instances = await db.subscriptionInstance.findMany({
     where: { shop, customerId, targetProductId, status: "ACTIVE" },
     orderBy: { createdAt: "desc" },
   });
 
   if (instances.length === 0) return null;
 
-  // Single instance: if fingerprint stored and doesn't match, this renewal belongs to a
-  // different subscription (the matching instance hasn't been created yet)
+  // ── Contract isolation ──────────────────────────────────────────────────────
+  // When this renewal carries a contract id, an instance ALREADY bound to a DIFFERENT
+  // contract can never be the match — returning it would merge two separate
+  // subscriptions onto one rotation. Eligible instances are those bound to the same
+  // contract or not yet linked to any contract.
+  if (contractId) {
+    const eligible = instances.filter(
+      (i) => !i.subscriptionContractId || i.subscriptionContractId === contractId
+    );
+    if (eligible.length === 0) {
+      console.log(
+        `[rotation] customer=${customerId} all ${instances.length} active instance(s) belong to other contracts — ` +
+        `contractId=${contractId} is a NEW subscription, creating fresh instance`
+      );
+      return null;
+    }
+    instances = eligible;
+  }
+
+  // When we settle on an unlinked instance and we know the contract id, bind it so
+  // future renewals match by contract and other contracts can't claim it.
+  const bindContract = async (inst) => {
+    if (contractId && !inst.subscriptionContractId) {
+      await db.subscriptionInstance.update({
+        where: { id: inst.id },
+        data: { subscriptionContractId: contractId },
+      });
+      console.log(`[rotation] customer=${customerId} linked contractId=${contractId} to instance=${inst.id}`);
+    }
+    return inst;
+  };
+
+  // Single eligible instance: if a fingerprint is stored and doesn't match, this
+  // renewal belongs to a different subscription (its instance isn't created yet).
   if (instances.length === 1) {
     const inst = instances[0];
     if (inst.lineItemFingerprint && inst.lineItemFingerprint !== renewalFingerprint) {
@@ -110,14 +149,14 @@ async function findRenewalInstance(shop, customerId, targetProductId, contractId
       );
       return null;
     }
-    return inst;
+    return bindContract(inst);
   }
 
-  // Multiple instances — match by fingerprint
+  // Multiple eligible instances — match by fingerprint
   const matched = instances.find((i) => i.lineItemFingerprint === renewalFingerprint);
   if (matched) {
     console.log(`[rotation] customer=${customerId} matched instance=${matched.id} by fingerprint=${renewalFingerprint}`);
-    return matched;
+    return bindContract(matched);
   }
 
   // No fingerprint match — check for legacy instances (null fingerprint)
@@ -129,7 +168,7 @@ async function findRenewalInstance(shop, customerId, targetProductId, contractId
       data: { lineItemFingerprint: renewalFingerprint },
     });
     console.log(`[rotation] customer=${customerId} assigned fingerprint to legacy instance=${untagged[0].id}`);
-    return untagged[0];
+    return bindContract(untagged[0]);
   }
 
   // Multiple untagged instances — cannot reliably distinguish, use most-recent
@@ -139,7 +178,7 @@ async function findRenewalInstance(shop, customerId, targetProductId, contractId
     `Using most-recent=${instances[0].id}. ` +
     `Fix: delete stale SubscriptionInstance rows and re-test.`
   );
-  return instances[0];
+  return bindContract(instances[0]);
 }
 
 // ─── Log helpers ──────────────────────────────────────────────────────────────
