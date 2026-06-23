@@ -112,7 +112,6 @@ export default function Dashboard() {
       </s-section>
 
       {/* ── Recent Rotations ──────────────────────────────────────────────── */}
-      {/* ── - ──────────────────────────────────────────────── */}
       <s-section heading="Recent Rotations">
         {recentLogs.length === 0 ? (
           <div style={emptyState}>
