@@ -1,10 +1,14 @@
 /**
  * Core rotation logic.
  *
- * Entry point: processOrderWebhook(shop, order, admin)
- *
- * First order  → create SubscriptionInstance with line item fingerprint
- * Renewal order → find instance by contractId → fingerprint → recency fallback → rotate → prune logs
+ * Two entry points:
+ *   • processOrderWebhook(shop, order, admin)   — orders/create webhook.
+ *       First order → create SubscriptionInstance. Renewal → DEFER (the order has no
+ *       contract id, so it can't be routed to the right subscription here).
+ *   • processRenewalForContract(shop, order, admin, contractId) — called by the Loop
+ *       Flow endpoint (/api/subscription-contract-activated) on every renewal WITH the
+ *       contract id. Routes strictly by contract id: same contract → same instance,
+ *       new contract → fresh instance. This is where renewals actually rotate.
  */
 
 import db from "../db.server.js";
@@ -77,108 +81,6 @@ async function createSubscriptionInstance(shop, orderId, customerId, contractId,
     }
     throw err;
   }
-}
-
-async function findRenewalInstance(shop, customerId, targetProductId, contractId, renewalLineItems) {
-  // ── Priority 1: exact match by subscription contract id ─────────────────────
-  // The contract id is the subscription's true identity. Same contract id → same
-  // instance (continue its rotation). A renewal whose contract id has no instance is
-  // a DIFFERENT subscription and must get its own fresh instance — never another
-  // contract's instance.
-  if (contractId) {
-    const inst = await db.subscriptionInstance.findFirst({
-      where: { shop, subscriptionContractId: contractId, targetProductId, status: "ACTIVE" },
-    });
-    if (inst) {
-      console.log(`[rotation] customer=${customerId} matched instance=${inst.id} by contractId=${contractId}`);
-      return inst;
-    }
-    console.log(`[rotation] customer=${customerId} no instance for contractId=${contractId} — checking unlinked instances before treating as new`);
-  }
-
-  const renewalFingerprint = buildLineItemFingerprint(renewalLineItems);
-
-  let instances = await db.subscriptionInstance.findMany({
-    where: { shop, customerId, targetProductId, status: "ACTIVE" },
-    orderBy: { createdAt: "desc" },
-  });
-
-  if (instances.length === 0) return null;
-
-  // ── Contract isolation ──────────────────────────────────────────────────────
-  // When this renewal carries a contract id, an instance ALREADY bound to a DIFFERENT
-  // contract can never be the match — returning it would merge two separate
-  // subscriptions onto one rotation. Eligible instances are those bound to the same
-  // contract or not yet linked to any contract.
-  if (contractId) {
-    const eligible = instances.filter(
-      (i) => !i.subscriptionContractId || i.subscriptionContractId === contractId
-    );
-    if (eligible.length === 0) {
-      console.log(
-        `[rotation] customer=${customerId} all ${instances.length} active instance(s) belong to other contracts — ` +
-        `contractId=${contractId} is a NEW subscription, creating fresh instance`
-      );
-      return null;
-    }
-    instances = eligible;
-  }
-
-  // When we settle on an unlinked instance and we know the contract id, bind it so
-  // future renewals match by contract and other contracts can't claim it.
-  const bindContract = async (inst) => {
-    if (contractId && !inst.subscriptionContractId) {
-      await db.subscriptionInstance.update({
-        where: { id: inst.id },
-        data: { subscriptionContractId: contractId },
-      });
-      console.log(`[rotation] customer=${customerId} linked contractId=${contractId} to instance=${inst.id}`);
-    }
-    return inst;
-  };
-
-  // Single eligible instance: if a fingerprint is stored and doesn't match, this
-  // renewal belongs to a different subscription (its instance isn't created yet).
-  if (instances.length === 1) {
-    const inst = instances[0];
-    if (inst.lineItemFingerprint && inst.lineItemFingerprint !== renewalFingerprint) {
-      console.warn(
-        `[rotation] customer=${customerId} single instance=${inst.id} fingerprint mismatch — ` +
-        `renewal fingerprint=${renewalFingerprint} vs stored=${inst.lineItemFingerprint}. ` +
-        `Treating as new subscription.`
-      );
-      return null;
-    }
-    return bindContract(inst);
-  }
-
-  // Multiple eligible instances — match by fingerprint
-  const matched = instances.find((i) => i.lineItemFingerprint === renewalFingerprint);
-  if (matched) {
-    console.log(`[rotation] customer=${customerId} matched instance=${matched.id} by fingerprint=${renewalFingerprint}`);
-    return bindContract(matched);
-  }
-
-  // No fingerprint match — check for legacy instances (null fingerprint)
-  const untagged = instances.filter((i) => !i.lineItemFingerprint);
-  if (untagged.length === 1) {
-    // Exactly one legacy instance: assign this fingerprint to it and use it
-    await db.subscriptionInstance.update({
-      where: { id: untagged[0].id },
-      data: { lineItemFingerprint: renewalFingerprint },
-    });
-    console.log(`[rotation] customer=${customerId} assigned fingerprint to legacy instance=${untagged[0].id}`);
-    return bindContract(untagged[0]);
-  }
-
-  // Multiple untagged instances — cannot reliably distinguish, use most-recent
-  console.warn(
-    `[rotation] customer=${customerId} has ${instances.length} active instances for product=${targetProductId}, ` +
-    `fingerprint=${renewalFingerprint} unmatched (${untagged.length} untagged). ` +
-    `Using most-recent=${instances[0].id}. ` +
-    `Fix: delete stale SubscriptionInstance rows and re-test.`
-  );
-  return bindContract(instances[0]);
 }
 
 // ─── Log helpers ──────────────────────────────────────────────────────────────
@@ -347,9 +249,7 @@ export async function processOrderWebhook(shop, order, admin) {
 
   const customerId = String(order.customer?.id ?? "anonymous");
   const orderId    = String(order.id);
-  const orderGid   = `gid://shopify/Order/${orderId}`;
   const contractId = extractContractId(order);
-  const currency   = order.currency ?? "USD";
 
   const sourceIsLoopRenewal = order.source_name === "subscription_contract_checkout_one";
 
@@ -387,34 +287,147 @@ export async function processOrderWebhook(shop, order, admin) {
     }
 
     // ── Loop renewal order ────────────────────────────────────────────────────
-    let instance = await findRenewalInstance(
-      shop, customerId, group.targetProductId, contractId, targetLineItems
-    );
-
-    if (!instance) {
-      // No prior instance — customer subscribed before the app was installed.
-      // Create an instance now and rotate this renewal immediately (don't skip it).
-      // sourceIsLoopRenewal=true guarantees this is NOT a first purchase.
-      console.log(`[rotation] order=${orderId} → renewal, no prior instance (pre-install subscriber), creating and rotating`);
-      instance = await createSubscriptionInstance(shop, orderId, customerId, contractId, group, targetLineItems);
-    }
-
-    console.log(`[rotation] order=${orderId} sourceIsLoopRenewal=true instance=${instance.id} index=${instance.currentIndex}`);
-
-    // Duplicate protection — handles sequential webhook retries after a successful run
-    const alreadyLogged = await db.rotationLog.findFirst({
-      where: { shop, orderId: orderGid, customerId: instance.customerId },
-    });
-    if (alreadyLogged) {
-      console.log(`[rotation] order=${orderId} already processed, skipping duplicate`);
-      continue;
-    }
-
-    console.log(`[rotation] order=${orderId} → rotating instance=${instance.id} index=${instance.currentIndex} fingerprint=${instance.lineItemFingerprint ?? "none"}`);
-    await rotateOrderItems(shop, orderGid, instance, group, targetLineItems, currency, admin);
+    // Renewals are NOT rotated here. The renewal order payload does NOT contain the
+    // subscription contract id, so this webhook cannot tell two same-product
+    // subscriptions of the same customer apart. Rotation is driven instead by
+    // /api/subscription-contract-activated (Loop Flow), which fires on every renewal
+    // WITH the contract id (+ order id) → see processRenewalForContract(). That is the
+    // only place a renewal can be routed to the correct subscription instance.
+    console.log(`[rotation] order=${orderId} renewal — deferring to flow/activate (contract-authoritative rotation)`);
+    continue;
   }
 
   pruneOldLogs(shop).catch((err) =>
     console.error(`[rotation] pruneOldLogs error for ${shop}:`, err.message)
+  );
+}
+
+// ─── Flow-driven renewal rotation (contract-authoritative) ──────────────────────
+//
+// Loop renewal orders do NOT carry the subscription contract id, so the orders/create
+// webhook cannot route a renewal to the right subscription. Instead, the Loop Flow
+// calls /api/subscription-contract-activated on EVERY renewal with the contract id AND
+// the order id. That endpoint fetches the order and calls processRenewalForContract(),
+// which finds the instance strictly by contract id (or creates a fresh one), so two
+// subscriptions of the same customer + product stay completely separate.
+
+// Fetch a renewal order from the Admin API and shape it like the orders/create webhook
+// payload (snake_case) so the existing rotation + order-edit code can consume it.
+export async function fetchOrderForRotation(admin, orderNumericId) {
+  const orderGid = `gid://shopify/Order/${orderNumericId}`;
+  const res = await admin.graphql(`
+    query OrderForRotation($id: ID!) {
+      order(id: $id) {
+        id
+        sourceName
+        currencyCode
+        presentmentCurrencyCode
+        customer { id }
+        lineItems(first: 100) {
+          nodes {
+            quantity
+            variantTitle
+            variant { id }
+            product { id }
+            originalUnitPriceSet { presentmentMoney { amount currencyCode } }
+            discountAllocations { allocatedAmountSet { presentmentMoney { amount } } }
+          }
+        }
+      }
+    }
+  `, { variables: { id: orderGid } });
+
+  const data = await res.json();
+  const o = data?.data?.order;
+  if (!o) return null;
+
+  const numeric = (gid) => String(gid ?? "").split("/").pop();
+
+  return {
+    id: numeric(o.id),
+    source_name: o.sourceName,
+    currency: o.presentmentCurrencyCode ?? o.currencyCode ?? "USD",
+    customer: { id: o.customer?.id ? numeric(o.customer.id) : null },
+    note_attributes: [],
+    line_items: (o.lineItems?.nodes ?? []).map((li) => {
+      const unit = li.originalUnitPriceSet?.presentmentMoney?.amount ?? "0";
+      return {
+        product_id: li.product?.id ? numeric(li.product.id) : null,
+        variant_id: li.variant?.id ? numeric(li.variant.id) : null,
+        quantity: li.quantity,
+        variant_title: li.variantTitle,
+        properties: [],
+        price: unit,
+        price_set: { presentment_money: { amount: unit } },
+        discount_allocations: (li.discountAllocations ?? []).map((d) => ({
+          amount_set: { presentment_money: { amount: d.allocatedAmountSet?.presentmentMoney?.amount ?? "0" } },
+        })),
+      };
+    }),
+  };
+}
+
+// Rotate a renewal order, routing strictly by subscription contract id.
+//   - An ACTIVE instance with this contract id → continue its rotation.
+//   - No instance for this contract id → create a fresh one (new subscription).
+// This is what guarantees: same contract → same instance; different contract → new
+// instance, even for two identical same-product subscriptions of one customer.
+export async function processRenewalForContract(shop, order, admin, contractId) {
+  await db.shopSetting.upsert({ where: { shop }, create: { shop }, update: {} });
+
+  const customerId = String(order.customer?.id ?? "anonymous");
+  const orderId    = String(order.id);
+  const orderGid   = `gid://shopify/Order/${orderId}`;
+  const currency   = order.currency ?? "USD";
+
+  console.log(`[rotation/flow] order=${orderId} contractId=${contractId} customer=${customerId} source=${order.source_name}`);
+
+  const groups = await db.rotationGroup.findMany({
+    where: { shop, isActive: true },
+    include: { rotationItems: { where: { isActive: true }, orderBy: { sortOrder: "asc" } } },
+  });
+
+  if (groups.length === 0) {
+    console.log(`[rotation/flow] no active groups for shop=${shop}, skipping`);
+    return;
+  }
+
+  for (const group of groups) {
+    const targetNumericId = toNumericId(group.targetProductId);
+    const targetLineItems = (order.line_items ?? []).filter(
+      (li) => String(li.product_id) === targetNumericId
+    );
+
+    if (targetLineItems.length === 0) continue;
+
+    console.log(`[rotation/flow] order=${orderId} matched group=${group.id} product=${group.targetProductId} lineItems=${targetLineItems.length}`);
+
+    // Contract-authoritative lookup — never fingerprint-match across contracts.
+    let instance = await db.subscriptionInstance.findFirst({
+      where: { shop, subscriptionContractId: contractId, targetProductId: group.targetProductId, status: "ACTIVE" },
+    });
+
+    if (instance) {
+      console.log(`[rotation/flow] order=${orderId} matched EXISTING instance=${instance.id} by contractId=${contractId} index=${instance.currentIndex}`);
+    } else {
+      instance = await createSubscriptionInstance(shop, orderId, customerId, contractId, group, targetLineItems);
+      console.log(`[rotation/flow] order=${orderId} created NEW instance=${instance.id} for contractId=${contractId} (fresh subscription)`);
+    }
+
+    // Duplicate protection — flow/activate may be re-delivered for the same order.
+    const alreadyLogged = await db.rotationLog.findFirst({
+      where: { shop, orderId: orderGid, customerId: instance.customerId },
+    });
+    if (alreadyLogged) {
+      console.log(`[rotation/flow] order=${orderId} already processed, skipping duplicate`);
+      continue;
+    }
+
+    console.log(`[rotation/flow] order=${orderId} → rotating instance=${instance.id} index=${instance.currentIndex}`);
+    await rotateOrderItems(shop, orderGid, instance, group, targetLineItems, currency, admin);
+  }
+
+  pruneOldLogs(shop).catch((err) =>
+    console.error(`[rotation/flow] pruneOldLogs error for ${shop}:`, err.message)
   );
 }

@@ -1,9 +1,22 @@
 import db from "../db.server";
+import { unauthenticated } from "../shopify.server";
+import { fetchOrderForRotation, processRenewalForContract } from "../services/rotation.server";
 
 const SECRET = process.env.LOOP_CANCEL_SECRET ?? "";
 
-// When a Loop subscription becomes ACTIVE, back-fill subscriptionContractId on the
-// matching SubscriptionInstance so the cancel endpoint can later delete it precisely.
+/**
+ * POST /api/subscription-contract-activated  (called by a Loop Flow on every renewal)
+ *
+ * Expected JSON body: { contractId, customerId, orderId, shop }
+ *
+ * The renewal ORDER does not carry the subscription contract id, so the orders/create
+ * webhook cannot tell two same-product subscriptions of one customer apart. This Loop
+ * Flow fires on every renewal WITH the contract id + order id — the only place a renewal
+ * can be tied to its subscription. We use it to:
+ *   • Renewal order  → rotate the order, routed strictly by contract id
+ *                      (same contract → same instance; new contract → fresh instance).
+ *   • First order    → just link the contract id onto the instance orders/create made.
+ */
 export const action = async ({ request }) => {
   const secret = request.headers.get("x-rotation-secret") ?? "";
   if (SECRET && secret !== SECRET) {
@@ -20,19 +33,55 @@ export const action = async ({ request }) => {
 
   const rawContractId = body.contractId ? String(body.contractId) : null;
   const rawCustomerId = body.customerId ? String(body.customerId) : null;
+  const rawOrderId    = body.orderId ? String(body.orderId) : null;
   const shop          = body.shop ? String(body.shop) : null;
 
-  const customerId = rawCustomerId?.includes("/")
-    ? rawCustomerId.split("/").pop()
-    : rawCustomerId;
+  const customerId = rawCustomerId?.includes("/") ? rawCustomerId.split("/").pop() : rawCustomerId;
+  const orderNumericId = rawOrderId?.includes("/") ? rawOrderId.split("/").pop() : rawOrderId;
 
-  console.log("[flow/activate] received:", { contractId: rawContractId, customerId, shop });
+  console.log("[flow/activate] received:", { contractId: rawContractId, customerId, orderId: orderNumericId, shop });
 
-  if (!rawContractId || !customerId) {
-    return Response.json({ success: false, reason: "missing contractId or customerId" });
+  if (!rawContractId || !customerId || !shop) {
+    return Response.json({ success: false, reason: "missing contractId, customerId, or shop" });
   }
 
-  // Already back-filled — idempotent
+  // ── Preferred path: we have the order id ────────────────────────────────────
+  if (orderNumericId) {
+    try {
+      const { admin } = await unauthenticated.admin(shop);
+      const order = await fetchOrderForRotation(admin, orderNumericId);
+
+      if (!order) {
+        console.warn(`[flow/activate] order=${orderNumericId} not found via Admin API — falling back to instance linking`);
+      } else if (order.source_name === "subscription_contract_checkout_one") {
+        // Renewal → rotate, routed by contract id.
+        await processRenewalForContract(shop, order, admin, rawContractId);
+        return Response.json({ success: true, rotated: true });
+      } else {
+        // First order / activation → don't rotate; just bind the contract id to the
+        // instance that orders/create created for this exact order.
+        const own = await db.subscriptionInstance.findFirst({
+          where: { shop, originalOrderId: orderNumericId },
+          orderBy: { createdAt: "desc" },
+        });
+        if (own && (!own.subscriptionContractId || own.subscriptionContractId === rawContractId)) {
+          await db.subscriptionInstance.update({
+            where: { id: own.id },
+            data: { subscriptionContractId: rawContractId },
+          });
+          console.log(`[flow/activate] first order — linked contractId=${rawContractId} to instance=${own.id}`);
+          return Response.json({ success: true, linked: 1 });
+        }
+        console.log(`[flow/activate] first order=${orderNumericId} — no own unlinked instance, falling back to windowed linking`);
+      }
+    } catch (err) {
+      console.error(`[flow/activate] error processing order=${orderNumericId}: ${err.message} — falling back to instance linking`);
+    }
+  }
+
+  // ── Fallback: link contract id to a single unlinked instance ─────────────────
+  // (Used when no order id is provided, or the order lookup/rotation could not run.)
+
   const already = await db.subscriptionInstance.findFirst({
     where: { subscriptionContractId: rawContractId },
   });
@@ -41,31 +90,22 @@ export const action = async ({ request }) => {
     return Response.json({ success: true, updated: 0 });
   }
 
-  // Find active instances for this customer that have no contractId yet,
-  // created within the last 10 minutes (the subscription activates within seconds of purchase).
   const windowStart = new Date(Date.now() - 10 * 60 * 1000);
-  const whereClause = {
+  const baseWhere = {
     customerId,
     subscriptionContractId: null,
     status: "ACTIVE",
-    createdAt: { gte: windowStart },
     ...(shop ? { shop } : {}),
   };
 
   const candidates = await db.subscriptionInstance.findMany({
-    where: whereClause,
+    where: { ...baseWhere, createdAt: { gte: windowStart } },
     orderBy: { createdAt: "desc" },
   });
 
   if (candidates.length === 0) {
-    // Widen search — instance may have been created more than 10 minutes ago
     const wider = await db.subscriptionInstance.findMany({
-      where: {
-        customerId,
-        subscriptionContractId: null,
-        status: "ACTIVE",
-        ...(shop ? { shop } : {}),
-      },
+      where: baseWhere,
       orderBy: { createdAt: "desc" },
     });
 
@@ -82,22 +122,12 @@ export const action = async ({ request }) => {
     return Response.json({ success: true, updated: 0 });
   }
 
-  if (candidates.length === 1) {
-    await db.subscriptionInstance.update({
-      where: { id: candidates[0].id },
-      data: { subscriptionContractId: rawContractId },
-    });
-    console.log(`[flow/activate] back-filled contractId=${rawContractId} on instance=${candidates[0].id}`);
-    return Response.json({ success: true, updated: 1 });
-  }
-
-  // Multiple candidates in the window — use most recent (just-purchased subscription)
   await db.subscriptionInstance.update({
     where: { id: candidates[0].id },
     data: { subscriptionContractId: rawContractId },
   });
   console.log(
-    `[flow/activate] ${candidates.length} candidates in window, used most-recent instance=${candidates[0].id} for contractId=${rawContractId}`,
+    `[flow/activate] ${candidates.length} candidate(s) in window, linked contractId=${rawContractId} to most-recent instance=${candidates[0].id}`,
   );
   return Response.json({ success: true, updated: 1 });
 };
