@@ -84,9 +84,11 @@ export const action = async ({ request, params }) => {
     const current = await db.rotationGroup.findFirst({ where: { id: params.id, shop }, select: { skipMatchBy: true } });
     await db.rotationGroup.updateMany({ where: { id: params.id, shop }, data: { isActive, freeRotation, keepTargetProduct, autoFulfill, skipMatchBy } });
     if (current && current.skipMatchBy !== skipMatchBy) {
-      // Match mode changed → stored purchasedProductIds keys are in the old form (id vs title).
-      // Reset them so each instance re-backfills from history in the new form on its next renewal.
-      await db.subscriptionInstance.updateMany({ where: { rotationGroupId: params.id }, data: { purchasedProductIds: null } });
+      // Match mode changed → re-backfill both purchased lists in the new form on next renewal.
+      await db.subscriptionInstance.updateMany({
+        where: { rotationGroupId: params.id },
+        data: { purchasedProductIds: null, purchasedProductTitles: null },
+      });
     }
     return { success: "Group settings saved." };
   }
