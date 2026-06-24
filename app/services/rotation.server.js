@@ -39,6 +39,15 @@ function serializePurchased(ids) {
   return JSON.stringify([...new Set((ids ?? []).map(String))]);
 }
 
+// The "skip key" for a product, per the group's skipMatchBy setting:
+//   PRODUCT_TITLE → lowercased, trimmed product title (matches across different product IDs
+//                   that share a title — useful for old/duplicate products).
+//   PRODUCT_ID    → numeric product id (default, exact).
+function rotationKey(productIdOrGid, productTitle, mode) {
+  if (mode === "PRODUCT_TITLE") return String(productTitle ?? "").toLowerCase().trim();
+  return toNumericId(productIdOrGid);
+}
+
 function buildUniqueKey(shop, customerId, targetProductId, orderId) {
   return `${shop}:${customerId}:${toNumericId(targetProductId)}:${orderId}`;
 }
@@ -165,15 +174,20 @@ async function rotateOrderItems(shop, orderGid, instance, group, targetLineItems
   // appended to after each rotation). Walk forward from currentIndex to the first item NOT
   // yet received. If every rotation product has already been received (full cycle complete),
   // stop skipping and rotate normally — the cycle starts over and we stop checking.
+  // skipMatchBy controls how "already received" is matched: by product id (default) or by
+  // lowercased product title. purchasedProductIds stores keys in this same form.
+  const mode = group.skipMatchBy ?? "PRODUCT_ID";
+  const keyOf = (item) => rotationKey(item.productId, item.productTitle, mode);
+
   const purchased = new Set(parsePurchased(instance.purchasedProductIds));
   let selectedIndex = instance.currentIndex % n;
   if (purchased.size > 0) {
     let found = null;
     for (let step = 0; step < n; step++) {
       const idx = (instance.currentIndex + step) % n;
-      const pid = toNumericId(activeItems[idx].productId);
-      if (purchased.has(pid)) {
-        console.log(`[rotation] order=${orderGid} skipping index=${idx} product=${pid} ("${activeItems[idx].productTitle}") — already received by this subscription`);
+      const key = keyOf(activeItems[idx]);
+      if (purchased.has(key)) {
+        console.log(`[rotation] order=${orderGid} skipping index=${idx} ${mode === "PRODUCT_TITLE" ? `title="${activeItems[idx].productTitle}"` : `product=${key}`} — already received by this subscription`);
         continue;
       }
       found = idx;
@@ -189,13 +203,14 @@ async function rotateOrderItems(shop, orderGid, instance, group, targetLineItems
   const nextItem = activeItems[selectedIndex];
   const newIndex = (selectedIndex + 1) % n;
   const nextItemPid = toNumericId(nextItem.productId);
-  console.log(`[rotation] order=${orderGid} selected rotation product index=${selectedIndex} productId=${nextItemPid} title="${nextItem.productTitle}"`);
+  const nextItemKey = keyOf(nextItem);
+  console.log(`[rotation] order=${orderGid} selected rotation product index=${selectedIndex} productId=${nextItemPid} title="${nextItem.productTitle}" skipMatchBy=${mode}`);
 
   // Compute purchasedProductIds to persist on a successful rotation: append the selected
-  // product; once the full set has been received, reset to [] so the next cycle rotates
-  // from scratch and the skip check stops (per spec).
-  const updatedPurchased = [...purchased, nextItemPid];
-  const coversAll = activeItems.every((it) => updatedPurchased.includes(toNumericId(it.productId)));
+  // product's key; once the full set has been received, reset to [] so the next cycle
+  // rotates from scratch and the skip check stops (per spec).
+  const updatedPurchased = [...purchased, nextItemKey];
+  const coversAll = activeItems.every((it) => updatedPurchased.includes(keyOf(it)));
   const newPurchasedJson = coversAll ? serializePurchased([]) : serializePurchased(updatedPurchased);
   if (coversAll) console.log(`[rotation] order=${orderGid} rotation cycle complete — purchased history reset`);
 
@@ -362,9 +377,12 @@ export async function processOrderWebhook(shop, order, admin) {
       //
       // Seed purchasedProductIds with any rotation-group products already present in this
       // FIRST order, so the first renewal skips them instead of re-sending (spec #1).
+      // Keys are in the group's skipMatchBy form (product id or lowercased title).
+      const seedMode = group.skipMatchBy ?? "PRODUCT_ID";
+      const seedRotationKeys = new Set(group.rotationItems.map((it) => rotationKey(it.productId, it.productTitle, seedMode)));
       const seeded = (order.line_items ?? [])
-        .map((li) => String(li.product_id))
-        .filter((pid) => group.rotationItems.some((it) => toNumericId(it.productId) === pid));
+        .map((li) => rotationKey(li.product_id, li.title, seedMode))
+        .filter((key) => key && seedRotationKeys.has(key));
 
       await createSubscriptionInstance(shop, orderId, customerId, contractId, group, targetLineItems, {
         purchasedProductIds: serializePurchased(seeded),
@@ -472,7 +490,7 @@ async function fetchCustomerOrdersLight(admin, customerNumericId, max = 100) {
           nodes {
             id
             sourceName
-            lineItems(first: 100) { nodes { quantity product { id } } }
+            lineItems(first: 100) { nodes { quantity title product { id } } }
           }
         }
       }
@@ -488,13 +506,15 @@ async function fetchCustomerOrdersLight(admin, customerNumericId, max = 100) {
   return orders;
 }
 
-// From the customer's orders, collect the rotation-group products already received.
-// Scoped to subscription-related orders only — an order is counted if it is a Loop
-// renewal OR it contains the target subscription product — so unrelated standalone
-// purchases never suppress a rotation product. Returns numeric productIds.
+// From the customer's orders, collect the rotation-group products already received, as
+// "skip keys" (numeric productId or lowercased title, per group.skipMatchBy). Scoped to
+// subscription-related orders only — an order is counted if it is a Loop renewal OR it
+// contains the target subscription product — so unrelated standalone purchases never
+// suppress a rotation product.
 function receivedRotationProductIds(customerOrders, group, excludeOrderNumericId) {
+  const mode = group.skipMatchBy ?? "PRODUCT_ID";
   const targetNumericId = toNumericId(group.targetProductId);
-  const rotationIds = new Set(group.rotationItems.map((it) => toNumericId(it.productId)));
+  const rotationKeys = new Set(group.rotationItems.map((it) => rotationKey(it.productId, it.productTitle, mode)));
   const received = new Set();
 
   for (const o of customerOrders) {
@@ -509,8 +529,8 @@ function receivedRotationProductIds(customerOrders, group, excludeOrderNumericId
 
     for (const li of items) {
       if ((li.quantity ?? 0) <= 0) continue;
-      const pid = li.product?.id ? toNumericId(li.product.id) : null;
-      if (pid && rotationIds.has(pid)) received.add(pid);
+      const key = rotationKey(li.product?.id, li.title, mode);
+      if (key && rotationKeys.has(key)) received.add(key);
     }
   }
   return received;
