@@ -63,6 +63,7 @@ export default function RotationLogsPage() {
               <option value="SUCCESS">Success</option>
               <option value="FAILED">Failed</option>
               <option value="SKIPPED">Skipped</option>
+              <option value="MANUAL">Manual review</option>
             </select>
           </div>
           <div style={{ display: "flex", alignItems: "flex-end", gap: "8px" }}>
@@ -181,6 +182,7 @@ function StatusBadge({ status }) {
     SUCCESS: { bg: "#e3f5e9", color: "#008060" },
     FAILED:  { bg: "#fce8e8", color: "#d82c0d" },
     SKIPPED: { bg: "#fff5e5", color: "#b98900" },
+    MANUAL:  { bg: "#ede9fe", color: "#5b21b6" },
   };
   const s = map[status] ?? { bg: "#f1f2f3", color: "#6d7175" };
   return (

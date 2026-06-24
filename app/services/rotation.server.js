@@ -16,7 +16,7 @@ import { performOrderEdit, autoFulfillRotationItems } from "./order-edit.server.
 
 const STATUS_ACTIVE = "ACTIVE";
 const STATUS_MANUAL = "NEEDS_MANUAL_REVIEW";
-const MANUAL_REVIEW_MESSAGE = "Unable to uniquely identify old subscription instance. Manual review required.";
+const MANUAL_REVIEW_MESSAGE = "Unable to uniquely identify old subscription instance. Manual review needed.";
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
 
@@ -252,20 +252,28 @@ async function rotateOrderItems(shop, orderGid, instance, group, targetLineItems
       data: { currentIndex: instance.currentIndex, purchasedProductIds: instance.purchasedProductIds ?? null },
     });
 
+  // Manual-review subscriptions STILL rotate (so the customer gets a product) but are
+  // left UNFULFILLED and logged as MANUAL so a human can verify before fulfilling (spec #6).
+  const isManual = instance.status === STATUS_MANUAL;
+  const successStatus = isManual ? "MANUAL" : "SUCCESS";
+  const allowFulfill = (group.autoFulfill ?? false) && !isManual;
+
   try {
     await performOrderEdit({
       admin, orderGid, targetLineItems, nextItem, currency,
       freeRotation: group.freeRotation ?? false,
       keepTargetProduct: group.keepTargetProduct ?? false,
     });
-    if (group.autoFulfill) {
+    if (allowFulfill) {
       try {
         await autoFulfillRotationItems(admin, orderGid, nextItem.productId);
       } catch (fulfillErr) {
         console.warn(`[rotation] order=${orderGid} autoFulfill error (non-fatal): ${fulfillErr.message}`);
       }
+    } else if (isManual) {
+      console.log(`[rotation] order=${orderGid} NEEDS_MANUAL_REVIEW — rotation product added but left UNFULFILLED`);
     }
-    await writeLog(shop, orderGid, instance, nextItem, group, "SUCCESS");
+    await writeLog(shop, orderGid, instance, nextItem, group, successStatus, isManual ? MANUAL_REVIEW_MESSAGE : null);
   } catch (err) {
     if (err.concurrent) {
       if (err.message.includes("Order already processed by concurrent webhook run")) {
@@ -285,15 +293,15 @@ async function rotateOrderItems(shop, orderGid, instance, group, targetLineItems
             keepTargetProduct: false,
             skipZeroOut: true,
           });
-          if (group.autoFulfill) {
+          if (allowFulfill) {
             try {
               await autoFulfillRotationItems(admin, orderGid, nextItem.productId);
             } catch (fulfillErr) {
               console.warn(`[rotation] order=${orderGid} autoFulfill error (non-fatal): ${fulfillErr.message}`);
             }
           }
-          await writeLog(shop, orderGid, instance, nextItem, group, "SUCCESS",
-            "Additive rotation — product added alongside fulfilled original");
+          await writeLog(shop, orderGid, instance, nextItem, group, successStatus,
+            isManual ? MANUAL_REVIEW_MESSAGE : "Additive rotation — product added alongside fulfilled original");
           console.log(`[rotation] order=${orderGid} additive edit succeeded`);
         } catch (retryErr) {
           // Both attempts failed — roll back index so next renewal retries this slot
@@ -596,35 +604,31 @@ export async function processRenewalForContract(shop, order, admin, contractId) 
         });
         const ambiguous = otherSubscriptions > 0 || fpMatches.length > 1;
 
-        if (ambiguous) {
-          instance = await createSubscriptionInstance(shop, orderId, customerId, contractId, group, targetLineItems, {
-            status: STATUS_MANUAL,
-            purchasedProductIds: serializePurchased([]),
-          });
-          console.warn(`[rotation/flow] order=${orderId} MANUAL REVIEW required — ${otherSubscriptions} other subscription(s), ${fpMatches.length} unlinked candidate(s) — instance=${instance.id}`);
-          await writeLog(shop, orderGid, instance, null, group, "SKIPPED", MANUAL_REVIEW_MESSAGE);
-          continue;
-        }
-
+        // Backfill the already-received products from history either way, so the skip
+        // logic works for the manual-review case too.
         const orders = await loadCustomerOrders();
         const received = [...receivedRotationProductIds(orders, group, orderId)];
         console.log(`[rotation/flow] order=${orderId} backfill — products found in old order history=[${received.join(", ") || "none"}]`);
 
         instance = await createSubscriptionInstance(shop, orderId, customerId, contractId, group, targetLineItems, {
           currentIndex: 0,
+          status: ambiguous ? STATUS_MANUAL : STATUS_ACTIVE,
           purchasedProductIds: serializePurchased(received),
         });
-        console.log(`[rotation/flow] order=${orderId} backfill completed — created NEW instance=${instance.id} purchased=[${received.join(", ") || "none"}]`);
+
+        if (ambiguous) {
+          // Spec #6: we cannot uniquely identify which old subscription this is, so flag it
+          // for manual review — but STILL rotate the order (with the skip logic). rotateOrderItems
+          // logs it as MANUAL and leaves the rotation product UNFULFILLED for a human to verify.
+          console.warn(`[rotation/flow] order=${orderId} MANUAL REVIEW needed — ${otherSubscriptions} other subscription(s), ${fpMatches.length} unlinked candidate(s) — rotating but leaving UNFULFILLED — instance=${instance.id} purchased=[${received.join(", ") || "none"}]`);
+        } else {
+          console.log(`[rotation/flow] order=${orderId} backfill completed — created NEW instance=${instance.id} purchased=[${received.join(", ") || "none"}]`);
+        }
       }
     }
 
-    // Flagged instance (now or previously) → never auto-edit (spec #6).
-    if (instance.status === STATUS_MANUAL) {
-      const flaggedAlready = await db.rotationLog.findFirst({ where: { shop, orderId: orderGid } });
-      if (!flaggedAlready) await writeLog(shop, orderGid, instance, null, group, "SKIPPED", MANUAL_REVIEW_MESSAGE);
-      console.warn(`[rotation/flow] order=${orderId} instance=${instance.id} flagged NEEDS_MANUAL_REVIEW — skipping rotation`);
-      continue;
-    }
+    // NOTE: a NEEDS_MANUAL_REVIEW instance is NOT skipped — it still rotates (unfulfilled),
+    // and rotateOrderItems writes the MANUAL RotationLog. See spec #6.
 
     // Duplicate protection — flow/activate may be re-delivered for the same order.
     const alreadyLogged = await db.rotationLog.findFirst({
