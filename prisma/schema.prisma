@@ -91,7 +91,8 @@ model SubscriptionInstance {
   lastProcessedOrderId   String?
   uniqueKey              String   @unique
   lineItemFingerprint    String?
-  status                 String   @default("ACTIVE") // ACTIVE | PAUSED | CANCELLED
+  purchasedProductIds    String?  // JSON array of numeric productIds already received in THIS subscription (skip list)
+  status                 String   @default("ACTIVE") // ACTIVE | PAUSED | CANCELLED | NEEDS_MANUAL_REVIEW
   rotationGroupId        String
   createdAt              DateTime @default(now())
   updatedAt              DateTime @updatedAt

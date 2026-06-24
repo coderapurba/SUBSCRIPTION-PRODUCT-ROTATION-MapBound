@@ -14,10 +14,29 @@
 import db from "../db.server.js";
 import { performOrderEdit, autoFulfillRotationItems } from "./order-edit.server.js";
 
+const STATUS_ACTIVE = "ACTIVE";
+const STATUS_MANUAL = "NEEDS_MANUAL_REVIEW";
+const MANUAL_REVIEW_MESSAGE = "Unable to uniquely identify old subscription instance. Manual review required.";
+
 // ─── Utilities ────────────────────────────────────────────────────────────────
 
 function toNumericId(gid) {
   return String(gid).split("/").pop();
+}
+
+// purchasedProductIds is stored as a JSON array of numeric productId strings.
+function parsePurchased(json) {
+  if (!json) return [];
+  try {
+    const arr = JSON.parse(json);
+    return Array.isArray(arr) ? arr.map(String) : [];
+  } catch {
+    return [];
+  }
+}
+
+function serializePurchased(ids) {
+  return JSON.stringify([...new Set((ids ?? []).map(String))]);
 }
 
 function buildUniqueKey(shop, customerId, targetProductId, orderId) {
@@ -49,7 +68,10 @@ function extractContractId(order) {
 
 // ─── Instance helpers ─────────────────────────────────────────────────────────
 
-async function createSubscriptionInstance(shop, orderId, customerId, contractId, group, targetLineItems) {
+async function createSubscriptionInstance(
+  shop, orderId, customerId, contractId, group, targetLineItems,
+  { currentIndex = 0, purchasedProductIds = null, status = STATUS_ACTIVE } = {}
+) {
   const uniqueKey = buildUniqueKey(shop, customerId, group.targetProductId, orderId);
   const fingerprint = buildLineItemFingerprint(targetLineItems);
 
@@ -66,10 +88,11 @@ async function createSubscriptionInstance(shop, orderId, customerId, contractId,
         originalOrderId: orderId,
         subscriptionContractId: contractId ?? null,
         targetProductId: group.targetProductId,
-        currentIndex: 0,
+        currentIndex,
         uniqueKey,
         lineItemFingerprint: fingerprint,
-        status: "ACTIVE",
+        purchasedProductIds,
+        status,
         rotationGroupId: group.id,
       },
     });
@@ -126,7 +149,7 @@ async function pruneOldLogs(shop) {
 
 // ─── Rotation ─────────────────────────────────────────────────────────────────
 
-async function rotateOrderItems(shop, orderGid, instance, group, targetLineItems, currency, admin, skipProductIds = new Set()) {
+async function rotateOrderItems(shop, orderGid, instance, group, targetLineItems, currency, admin) {
   const activeItems = group.rotationItems;
 
   if (activeItems.length === 0) {
@@ -137,17 +160,19 @@ async function rotateOrderItems(shop, orderGid, instance, group, targetLineItems
   const n = activeItems.length;
 
   // ── Select the next product, skipping ones already received by this subscription ──
-  // skipProductIds = numeric productIds this subscription (contract) has already received
-  // in its past orders. Walk forward from currentIndex to the first item NOT yet received.
-  // If every rotation product has already been received (full cycle complete), stop
-  // skipping and rotate normally — the cycle starts over.
+  // purchasedProductIds (persisted on the instance) = numeric productIds this subscription
+  // has already received (seeded from the first order / backfilled from history, then
+  // appended to after each rotation). Walk forward from currentIndex to the first item NOT
+  // yet received. If every rotation product has already been received (full cycle complete),
+  // stop skipping and rotate normally — the cycle starts over and we stop checking.
+  const purchased = new Set(parsePurchased(instance.purchasedProductIds));
   let selectedIndex = instance.currentIndex % n;
-  if (skipProductIds.size > 0) {
+  if (purchased.size > 0) {
     let found = null;
     for (let step = 0; step < n; step++) {
       const idx = (instance.currentIndex + step) % n;
       const pid = toNumericId(activeItems[idx].productId);
-      if (skipProductIds.has(pid)) {
+      if (purchased.has(pid)) {
         console.log(`[rotation] order=${orderGid} skipping index=${idx} product=${pid} ("${activeItems[idx].productTitle}") — already received by this subscription`);
         continue;
       }
@@ -163,8 +188,18 @@ async function rotateOrderItems(shop, orderGid, instance, group, targetLineItems
 
   const nextItem = activeItems[selectedIndex];
   const newIndex = (selectedIndex + 1) % n;
+  const nextItemPid = toNumericId(nextItem.productId);
+  console.log(`[rotation] order=${orderGid} selected rotation product index=${selectedIndex} productId=${nextItemPid} title="${nextItem.productTitle}"`);
 
-  if (toNumericId(nextItem.productId) === toNumericId(group.targetProductId)) {
+  // Compute purchasedProductIds to persist on a successful rotation: append the selected
+  // product; once the full set has been received, reset to [] so the next cycle rotates
+  // from scratch and the skip check stops (per spec).
+  const updatedPurchased = [...purchased, nextItemPid];
+  const coversAll = activeItems.every((it) => updatedPurchased.includes(toNumericId(it.productId)));
+  const newPurchasedJson = coversAll ? serializePurchased([]) : serializePurchased(updatedPurchased);
+  if (coversAll) console.log(`[rotation] order=${orderGid} rotation cycle complete — purchased history reset`);
+
+  if (nextItemPid === toNumericId(group.targetProductId)) {
     const claimed = await db.subscriptionInstance.updateMany({
       where: {
         id: instance.id,
@@ -183,8 +218,8 @@ async function rotateOrderItems(shop, orderGid, instance, group, targetLineItems
   }
 
   // ── Optimistic lock ────────────────────────────────────────────────────────
-  // Atomically advance currentIndex AND record which order we're processing.
-  // Two conditions must both be true for a run to win:
+  // Atomically advance currentIndex, persist purchasedProductIds, AND record which order
+  // we're processing. Two conditions must both be true for a run to win:
   //   1. currentIndex still matches what we read (prevents concurrent runs from
   //      claiming the same slot from different webhook deliveries at the same time)
   //   2. lastProcessedOrderId is different from this order (prevents sequential
@@ -192,13 +227,15 @@ async function rotateOrderItems(shop, orderGid, instance, group, targetLineItems
   //      Run 2 arrives 7s later and would see index=1 and win slot 1→2 for the
   //      same order. With lastProcessedOrderId, Run 2 loses because Run 1 already
   //      stamped this order, even before writing the SUCCESS log.)
+  // purchasedProductIds is written here and rolled back on failure — this gives the
+  // required "append the selected productId after a successful rotation" behaviour.
   const claimed = await db.subscriptionInstance.updateMany({
     where: {
       id: instance.id,
       currentIndex: instance.currentIndex,
       OR: [{ lastProcessedOrderId: null }, { lastProcessedOrderId: { not: orderGid } }],
     },
-    data: { currentIndex: newIndex, lastProcessedOrderId: orderGid },
+    data: { currentIndex: newIndex, lastProcessedOrderId: orderGid, purchasedProductIds: newPurchasedJson },
   });
 
   if (claimed.count === 0) {
@@ -207,6 +244,13 @@ async function rotateOrderItems(shop, orderGid, instance, group, targetLineItems
   }
 
   console.log(`[rotation] order=${orderGid} claimed slot index=${selectedIndex}→${newIndex}`);
+
+  // Roll currentIndex AND purchasedProductIds back to their pre-claim values.
+  const rollback = () =>
+    db.subscriptionInstance.update({
+      where: { id: instance.id },
+      data: { currentIndex: instance.currentIndex, purchasedProductIds: instance.purchasedProductIds ?? null },
+    });
 
   try {
     await performOrderEdit({
@@ -228,7 +272,7 @@ async function rotateOrderItems(shop, orderGid, instance, group, targetLineItems
         // Zero-out saw a conflicting change (rare with the DB lock). Roll back so
         // the next renewal retries at this slot.
         console.log(`[rotation] order=${orderGid} zero-out conflict (unexpected with lock) — rolling back index`);
-        await db.subscriptionInstance.update({ where: { id: instance.id }, data: { currentIndex: instance.currentIndex } });
+        await rollback();
       } else {
         // Commit failed — order is likely already fulfilled (Shopify rejects removing
         // fulfilled line items). Retry as additive: add rotation product without
@@ -254,7 +298,7 @@ async function rotateOrderItems(shop, orderGid, instance, group, targetLineItems
         } catch (retryErr) {
           // Both attempts failed — roll back index so next renewal retries this slot
           console.warn(`[rotation] order=${orderGid} additive retry also failed: ${retryErr.message}`);
-          await db.subscriptionInstance.update({ where: { id: instance.id }, data: { currentIndex: instance.currentIndex } });
+          await rollback();
           await writeLog(shop, orderGid, instance, nextItem, group, "FAILED",
             `Both edit attempts failed: ${retryErr.message}`);
         }
@@ -262,7 +306,7 @@ async function rotateOrderItems(shop, orderGid, instance, group, targetLineItems
       return;
     }
     // Unexpected error — roll back index and re-throw
-    await db.subscriptionInstance.update({ where: { id: instance.id }, data: { currentIndex: instance.currentIndex } });
+    await rollback();
     await writeLog(shop, orderGid, instance, nextItem, group, "FAILED", err.message);
     throw err;
   }
@@ -305,10 +349,22 @@ export async function processOrderWebhook(shop, order, admin) {
 
     if (!sourceIsLoopRenewal) {
       // New subscription purchase — create a fresh independent instance with fingerprint.
-      // Do NOT cancel other active instances — each purchase tracks its own rotation index.
+      // Do NOT edit first online orders. Do NOT cancel other active instances.
       // Real cancellations are handled by the subscription-contracts/cancel webhook.
-      await createSubscriptionInstance(shop, orderId, customerId, contractId, group, targetLineItems);
-      console.log(`[rotation] order=${orderId} → new subscription purchase, fresh instance created`);
+      //
+      // Seed purchasedProductIds with any rotation-group products already present in this
+      // FIRST order, so the first renewal skips them instead of re-sending (spec #1).
+      const seeded = (order.line_items ?? [])
+        .map((li) => String(li.product_id))
+        .filter((pid) => group.rotationItems.some((it) => toNumericId(it.productId) === pid));
+
+      await createSubscriptionInstance(shop, orderId, customerId, contractId, group, targetLineItems, {
+        purchasedProductIds: serializePurchased(seeded),
+      });
+      console.log(
+        `[rotation] order=${orderId} → NEW subscription purchase, fresh SubscriptionInstance created` +
+        (seeded.length ? ` (seeded already-received=[${seeded.join(", ")}])` : "")
+      );
       continue;
     }
 
@@ -477,8 +533,15 @@ export async function processRenewalForContract(shop, order, admin, contractId) 
     return;
   }
 
-  // The customer's orders, fetched lazily once, used for the "already received" skip.
+  // The customer's orders, fetched lazily once and reused, for backfill of old subscriptions.
   let customerOrders = null;
+  const loadCustomerOrders = async () => {
+    if (customerOrders === null) {
+      customerOrders = await fetchCustomerOrdersLight(admin, customerId);
+      console.log(`[rotation/flow] order=${orderId} fetched ${customerOrders.length} customer orders for backfill`);
+    }
+    return customerOrders;
+  };
 
   for (const group of groups) {
     const targetNumericId = toNumericId(group.targetProductId);
@@ -490,16 +553,77 @@ export async function processRenewalForContract(shop, order, admin, contractId) 
 
     console.log(`[rotation/flow] order=${orderId} matched group=${group.id} product=${group.targetProductId} lineItems=${targetLineItems.length}`);
 
-    // Contract-authoritative lookup — never fingerprint-match across contracts.
+    // ── Resolve the SubscriptionInstance (matching priority) ───────────────────
+    // 1) Exact subscription contract id → same subscription, continue its rotation.
     let instance = await db.subscriptionInstance.findFirst({
-      where: { shop, subscriptionContractId: contractId, targetProductId: group.targetProductId, status: "ACTIVE" },
+      where: { shop, subscriptionContractId: contractId, targetProductId: group.targetProductId, status: { in: [STATUS_ACTIVE, STATUS_MANUAL] } },
     });
 
     if (instance) {
-      console.log(`[rotation/flow] order=${orderId} matched EXISTING instance=${instance.id} by contractId=${contractId} index=${instance.currentIndex}`);
+      console.log(`[rotation/flow] order=${orderId} EXISTING SubscriptionInstance matched id=${instance.id} by contractId=${contractId} index=${instance.currentIndex} status=${instance.status}`);
     } else {
-      instance = await createSubscriptionInstance(shop, orderId, customerId, contractId, group, targetLineItems);
-      console.log(`[rotation/flow] order=${orderId} created NEW instance=${instance.id} for contractId=${contractId} (fresh subscription)`);
+      // 2) Adopt a single UNLINKED instance — a first-order instance created by
+      //    orders/create whose contract id isn't bound yet (matched by fingerprint).
+      const fp = buildLineItemFingerprint(targetLineItems);
+      const unlinked = await db.subscriptionInstance.findMany({
+        where: { shop, customerId, targetProductId: group.targetProductId, subscriptionContractId: null, status: STATUS_ACTIVE },
+        orderBy: { createdAt: "desc" },
+      });
+      const fpMatches = unlinked.filter((i) => !i.lineItemFingerprint || i.lineItemFingerprint === fp);
+
+      if (fpMatches.length === 1) {
+        instance = await db.subscriptionInstance.update({
+          where: { id: fpMatches[0].id },
+          data: { subscriptionContractId: contractId },
+        });
+        console.log(`[rotation/flow] order=${orderId} linked contractId=${contractId} to first-order instance=${instance.id} index=${instance.currentIndex}`);
+      } else {
+        // 3) No instance for this subscription → an OLD subscription that existed before
+        //    the app was installed. Backfill from history, with the multi-subscription
+        //    safety rule (spec #6).
+        console.log(`[rotation/flow] order=${orderId} MISSING SubscriptionInstance for old renewal contractId=${contractId} — backfill started`);
+
+        // Ambiguous when we cannot uniquely identify this old subscription: another
+        // subscription (different already-linked contract) exists for this customer+product,
+        // OR more than one unlinked candidate matches the fingerprint.
+        const otherSubscriptions = await db.subscriptionInstance.count({
+          where: {
+            shop, customerId, targetProductId: group.targetProductId,
+            subscriptionContractId: { not: null },
+            NOT: { subscriptionContractId: contractId },
+            status: { in: [STATUS_ACTIVE, STATUS_MANUAL] },
+          },
+        });
+        const ambiguous = otherSubscriptions > 0 || fpMatches.length > 1;
+
+        if (ambiguous) {
+          instance = await createSubscriptionInstance(shop, orderId, customerId, contractId, group, targetLineItems, {
+            status: STATUS_MANUAL,
+            purchasedProductIds: serializePurchased([]),
+          });
+          console.warn(`[rotation/flow] order=${orderId} MANUAL REVIEW required — ${otherSubscriptions} other subscription(s), ${fpMatches.length} unlinked candidate(s) — instance=${instance.id}`);
+          await writeLog(shop, orderGid, instance, null, group, "SKIPPED", MANUAL_REVIEW_MESSAGE);
+          continue;
+        }
+
+        const orders = await loadCustomerOrders();
+        const received = [...receivedRotationProductIds(orders, group, orderId)];
+        console.log(`[rotation/flow] order=${orderId} backfill — products found in old order history=[${received.join(", ") || "none"}]`);
+
+        instance = await createSubscriptionInstance(shop, orderId, customerId, contractId, group, targetLineItems, {
+          currentIndex: 0,
+          purchasedProductIds: serializePurchased(received),
+        });
+        console.log(`[rotation/flow] order=${orderId} backfill completed — created NEW instance=${instance.id} purchased=[${received.join(", ") || "none"}]`);
+      }
+    }
+
+    // Flagged instance (now or previously) → never auto-edit (spec #6).
+    if (instance.status === STATUS_MANUAL) {
+      const flaggedAlready = await db.rotationLog.findFirst({ where: { shop, orderId: orderGid } });
+      if (!flaggedAlready) await writeLog(shop, orderGid, instance, null, group, "SKIPPED", MANUAL_REVIEW_MESSAGE);
+      console.warn(`[rotation/flow] order=${orderId} instance=${instance.id} flagged NEEDS_MANUAL_REVIEW — skipping rotation`);
+      continue;
     }
 
     // Duplicate protection — flow/activate may be re-delivered for the same order.
@@ -511,17 +635,18 @@ export async function processRenewalForContract(shop, order, admin, contractId) 
       continue;
     }
 
-    // Skip rotation products this customer has already received in their subscription
-    // orders for this product (read from the customer's order history).
-    if (customerOrders === null) {
-      customerOrders = await fetchCustomerOrdersLight(admin, customerId);
-      console.log(`[rotation/flow] order=${orderId} fetched ${customerOrders.length} customer orders for the already-received check`);
+    // Lazy backfill: instances created before purchasedProductIds existed (or any null)
+    // get seeded from history once so the skip check has data.
+    if (instance.purchasedProductIds == null) {
+      const orders = await loadCustomerOrders();
+      const received = [...receivedRotationProductIds(orders, group, orderId)];
+      instance.purchasedProductIds = serializePurchased(received);
+      await db.subscriptionInstance.update({ where: { id: instance.id }, data: { purchasedProductIds: instance.purchasedProductIds } });
+      console.log(`[rotation/flow] order=${orderId} backfilled purchasedProductIds=[${received.join(", ") || "none"}] for existing instance=${instance.id}`);
     }
-    const receivedProductIds = receivedRotationProductIds(customerOrders, group, orderId);
-    console.log(`[rotation/flow] order=${orderId} group=${group.id} already-received rotation products=[${[...receivedProductIds].join(", ") || "none"}]`);
 
-    console.log(`[rotation/flow] order=${orderId} → rotating instance=${instance.id} index=${instance.currentIndex}`);
-    await rotateOrderItems(shop, orderGid, instance, group, targetLineItems, currency, admin, receivedProductIds);
+    console.log(`[rotation/flow] order=${orderId} → rotating instance=${instance.id} index=${instance.currentIndex} purchased=${instance.purchasedProductIds}`);
+    await rotateOrderItems(shop, orderGid, instance, group, targetLineItems, currency, admin);
   }
 
   pruneOldLogs(shop).catch((err) =>
