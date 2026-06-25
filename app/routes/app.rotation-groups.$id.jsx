@@ -80,9 +80,10 @@ export const action = async ({ request, params }) => {
     const freeRotation      = fd.get("freeRotation") === "true";
     const keepTargetProduct = fd.get("keepTargetProduct") === "true";
     const autoFulfill       = fd.get("autoFulfill") === "true";
+    const skipEnabled       = fd.get("skipEnabled") === "true";
     const skipMatchBy       = fd.get("skipMatchBy") === "PRODUCT_TITLE" ? "PRODUCT_TITLE" : "PRODUCT_ID";
     const current = await db.rotationGroup.findFirst({ where: { id: params.id, shop }, select: { skipMatchBy: true } });
-    await db.rotationGroup.updateMany({ where: { id: params.id, shop }, data: { isActive, freeRotation, keepTargetProduct, autoFulfill, skipMatchBy } });
+    await db.rotationGroup.updateMany({ where: { id: params.id, shop }, data: { isActive, freeRotation, keepTargetProduct, autoFulfill, skipEnabled, skipMatchBy } });
     if (current && current.skipMatchBy !== skipMatchBy) {
       // Match mode changed → re-backfill both purchased lists in the new form on next renewal.
       await db.subscriptionInstance.updateMany({
@@ -236,6 +237,7 @@ function GroupSettingsSection({ group }) {
   const [freeRotation, setFreeRotation] = useState(group.freeRotation ?? false);
   const [keepTargetProduct, setKeepTargetProduct] = useState(group.keepTargetProduct ?? false);
   const [autoFulfill, setAutoFulfill] = useState(group.autoFulfill ?? false);
+  const [skipEnabled, setSkipEnabled] = useState(group.skipEnabled ?? true);
   const [skipMatchBy, setSkipMatchBy] = useState(group.skipMatchBy ?? "PRODUCT_ID");
   const [showDeleteModal, setShowDeleteModal] = useState(false);
   const [isChangingTarget, setIsChangingTarget] = useState(false);
@@ -443,51 +445,98 @@ function GroupSettingsSection({ group }) {
           </div>
         </div>
 
-        {/* Skip-match-by selector */}
+        {/* Skip Already-Received toggle */}
         <div
+          onClick={() => setSkipEnabled(!skipEnabled)}
           style={{
-            padding: "14px 16px", borderRadius: "8px",
-            border: "1.5px solid #e1e3e5", background: "#fafafa",
+            display: "flex", alignItems: "center", justifyContent: "space-between", gap: "16px",
+            padding: "14px 16px", borderRadius: "8px", cursor: "pointer",
+            border: `1.5px solid ${skipEnabled ? "#008060" : "#e1e3e5"}`,
+            background: skipEnabled ? "#f0faf6" : "#fafafa",
+            transition: "all 0.18s",
           }}
         >
-          <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "3px" }}>
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#6d7175" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
-              <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
-            </svg>
-            <span style={{ fontSize: "13px", fontWeight: "600", color: "#303030" }}>Skip Already-Received Match By</span>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "3px" }}>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke={skipEnabled ? "#008060" : "#6d7175"} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
+                <polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>
+              </svg>
+              <span style={{ fontSize: "13px", fontWeight: "600", color: "#303030" }}>Skip Already-Received Products</span>
+              {skipEnabled && (
+                <span style={{ fontSize: "10px", fontWeight: "700", color: "#008060", background: "#c9f0e1", padding: "2px 7px", borderRadius: "10px", letterSpacing: "0.4px", textTransform: "uppercase" }}>ON</span>
+              )}
+            </div>
+            <div style={{ fontSize: "12px", color: "#6d7175", lineHeight: "1.5", paddingLeft: "24px" }}>
+              {skipEnabled
+                ? "Rotation products the customer already received are skipped — the next not-yet-received product is sent."
+                : "Skip check is off — products rotate strictly in sequence, even if the customer already received one."}
+            </div>
           </div>
-          <div style={{ fontSize: "12px", color: "#6d7175", lineHeight: "1.5", paddingLeft: "24px", marginBottom: "10px" }}>
-            How the app decides a rotation product was already received by the customer.
-            <strong> Product title</strong> matches the same book even if it has a different product ID (old/duplicate products); <strong>Product ID</strong> is an exact match.
-          </div>
-          <div style={{ display: "flex", gap: "8px", paddingLeft: "24px" }}>
-            {[
-              { value: "PRODUCT_ID", label: "Product ID" },
-              { value: "PRODUCT_TITLE", label: "Product Title" },
-            ].map((opt) => (
-              <button
-                key={opt.value}
-                type="button"
-                onClick={() => setSkipMatchBy(opt.value)}
-                style={{
-                  padding: "7px 14px", borderRadius: "8px", fontSize: "12px", fontWeight: "600", cursor: "pointer",
-                  border: `1.5px solid ${skipMatchBy === opt.value ? "#008060" : "#e1e3e5"}`,
-                  background: skipMatchBy === opt.value ? "#f0faf6" : "#fff",
-                  color: skipMatchBy === opt.value ? "#008060" : "#6d7175",
-                  transition: "all 0.18s",
-                }}
-              >
-                {opt.label}
-              </button>
-            ))}
+
+          {/* iOS-style toggle switch */}
+          <div style={{
+            position: "relative", width: "44px", height: "26px", borderRadius: "13px", flexShrink: 0,
+            background: skipEnabled ? "#008060" : "#c9cccf",
+            transition: "background 0.2s",
+          }}>
+            <div style={{
+              position: "absolute", top: "3px",
+              left: skipEnabled ? "21px" : "3px",
+              width: "20px", height: "20px", borderRadius: "50%",
+              background: "#fff",
+              boxShadow: "0 1px 4px rgba(0,0,0,0.25)",
+              transition: "left 0.2s",
+            }} />
           </div>
         </div>
+
+        {/* Skip-match-by selector — only shown when skip is enabled */}
+        {skipEnabled && (
+          <div
+            style={{
+              padding: "14px 16px", borderRadius: "8px",
+              border: "1.5px solid #e1e3e5", background: "#fafafa",
+            }}
+          >
+            <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "3px" }}>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#6d7175" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
+                <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+              </svg>
+              <span style={{ fontSize: "13px", fontWeight: "600", color: "#303030" }}>Skip Already-Received Match By</span>
+            </div>
+            <div style={{ fontSize: "12px", color: "#6d7175", lineHeight: "1.5", paddingLeft: "24px", marginBottom: "10px" }}>
+              How the app decides a rotation product was already received by the customer.
+              <strong> Product title</strong> matches the same book even if it has a different product ID (old/duplicate products); <strong>Product ID</strong> is an exact match.
+            </div>
+            <div style={{ display: "flex", gap: "8px", paddingLeft: "24px" }}>
+              {[
+                { value: "PRODUCT_ID", label: "Product ID" },
+                { value: "PRODUCT_TITLE", label: "Product Title" },
+              ].map((opt) => (
+                <button
+                  key={opt.value}
+                  type="button"
+                  onClick={() => setSkipMatchBy(opt.value)}
+                  style={{
+                    padding: "7px 14px", borderRadius: "8px", fontSize: "12px", fontWeight: "600", cursor: "pointer",
+                    border: `1.5px solid ${skipMatchBy === opt.value ? "#008060" : "#e1e3e5"}`,
+                    background: skipMatchBy === opt.value ? "#f0faf6" : "#fff",
+                    color: skipMatchBy === opt.value ? "#008060" : "#6d7175",
+                    transition: "all 0.18s",
+                  }}
+                >
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
 
         {/* Action buttons */}
         <div style={{ display: "flex", gap: "10px", paddingTop: "4px" }}>
           <button
             type="button"
-            onClick={() => fetcher.submit({ intent: "updateGroup", isActive: isActive.toString(), freeRotation: freeRotation.toString(), keepTargetProduct: keepTargetProduct.toString(), autoFulfill: autoFulfill.toString(), skipMatchBy }, { method: "post" })}
+            onClick={() => fetcher.submit({ intent: "updateGroup", isActive: isActive.toString(), freeRotation: freeRotation.toString(), keepTargetProduct: keepTargetProduct.toString(), autoFulfill: autoFulfill.toString(), skipEnabled: skipEnabled.toString(), skipMatchBy }, { method: "post" })}
             disabled={isBusy}
             style={isBusy ? { ...primaryBtn, opacity: 0.7 } : primaryBtn}
           >

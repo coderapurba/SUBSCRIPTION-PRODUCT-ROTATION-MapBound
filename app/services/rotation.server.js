@@ -187,8 +187,10 @@ async function rotateOrderItems(shop, orderGid, instance, group, targetLineItems
   const purchasedTitles = new Set(parsePurchased(instance.purchasedProductTitles));
   const purchasedActive = mode === "PRODUCT_TITLE" ? purchasedTitles : purchasedIds;
 
+  // skipEnabled OFF → don't check already-received; rotate strictly by currentIndex.
+  const skipEnabled = group.skipEnabled ?? true;
   let selectedIndex = instance.currentIndex % n;
-  if (purchasedActive.size > 0) {
+  if (skipEnabled && purchasedActive.size > 0) {
     let found = null;
     for (let step = 0; step < n; step++) {
       const idx = (instance.currentIndex + step) % n;

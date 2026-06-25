@@ -132,7 +132,9 @@ isActive           — when false, rotation is paused for this group
 freeRotation       — when true, rotation product is sent at 100% discount (free)
 keepTargetProduct  — when true, the original subscription product stays in the order
                      (rotation product is added alongside it; no remove + re-add)
-autoFulfill        — when true, rotation products are auto-marked fulfilled
+autoFulfill        — default auto-fulfill for rotation products (per-item override on RotationItem)
+skipEnabled        — when false, the "already received" skip check is disabled (strict
+                     sequence rotation); default true
 skipMatchBy        — "PRODUCT_ID" | "PRODUCT_TITLE": how the "already received" skip is
                      matched (exact id, or case-insensitive product title)
 @@unique([shop, targetProductId])
@@ -249,11 +251,13 @@ For each active RotationGroup with matching target line items:
 
 ```
 1. activeItems = group.rotationItems (active, sorted). If empty → log SKIPPED.
-2. SKIP LOGIC (skipMatchBy = PRODUCT_ID | PRODUCT_TITLE):
+2. SKIP LOGIC (only when group.skipEnabled; skipMatchBy = PRODUCT_ID | PRODUCT_TITLE):
    - Read the purchased set from the matching column (ids or lowercased titles).
    - Walk forward from currentIndex to the first product NOT yet received.
    - If ALL have been received → stop skipping and rotate from currentIndex (cycle
      starts over).
+   - When skipEnabled is false → no skip; rotate strictly by currentIndex. (The purchased
+     lists are still maintained, so re-enabling later resumes skipping correctly.)
 3. SELF-ROTATION GUARD: if the selected product === target product → advance + log
    SKIPPED, return.
 4. OPTIMISTIC LOCK (atomic updateMany on currentIndex + lastProcessedOrderId):
