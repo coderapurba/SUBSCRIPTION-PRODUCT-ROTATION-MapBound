@@ -1,9 +1,9 @@
 # Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
 
-client_id = "d21e4070182feeed9f1e242a2bc24865"
-name = "Subs Product Rotation Vmra"
+client_id = "cae66b88ce342e713316d3fc4da083b5"
 application_url = "https://subscription-product-rotation-map-b.vercel.app"
 embedded = true
+name = "Subscription Product RotationM"
 
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
