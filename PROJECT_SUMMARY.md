@@ -129,6 +129,12 @@ shop
 targetProductId    — GID: "gid://shopify/Product/XXXXX"
 targetProductTitle — display name
 isActive           — when false, rotation is paused for this group
+freeRotation       — when true, rotation product is sent at 100% discount (free)
+keepTargetProduct  — when true, the original subscription product stays in the order
+                     (rotation product is added alongside it; no remove + re-add)
+autoFulfill        — when true, rotation products are auto-marked fulfilled
+skipMatchBy        — "PRODUCT_ID" | "PRODUCT_TITLE": how the "already received" skip is
+                     matched (exact id, or case-insensitive product title)
 @@unique([shop, targetProductId])
 ```
 
@@ -144,30 +150,39 @@ productTitle
 variantTitle  — e.g. "Teen Boys", "Default Title"
 sortOrder     — 0-based integer; determines rotation order
 isActive      — when false, item is skipped during rotation
+autoFulfill   — per-product auto-fulfill override (Boolean?); null = inherit RotationGroup.autoFulfill
 imageUrl      — cached product thumbnail
 price         — cached variant price (display only)
 ```
 
 ### `SubscriptionInstance`
-One row per customer subscription. Tracks WHERE in the rotation sequence that customer currently is.
+One row per customer subscription. Tracks WHERE in the rotation sequence that customer currently is, and which rotation products have already been received.
 
 ```
 id (cuid)
 shop
 customerId             — Shopify customer numeric ID (string)
-originalOrderId        — ID of the first order that created this instance
-subscriptionContractId — Loop contract GID (nullable)
+originalOrderId        — ID of the order that created this instance
+subscriptionContractId — Loop SubscriptionContract GID — the PRIMARY identity for matching renewals
 targetProductId        — GID of the product being rotated
 currentIndex           — integer: index into rotationItems array
+lastProcessedOrderId   — GID of the last order rotated (optimistic-lock stamp)
 uniqueKey              — "{shop}:{customerId}:{numericProductId}:{originalOrderId}"
-status                 — "ACTIVE" | "PAUSED" | "CANCELLED"
+lineItemFingerprint    — sorted "variantId:qty,..." of the target line items
+purchasedProductIds    — JSON array of numeric productIds already received (skip list)
+purchasedProductTitles — JSON array of lowercased titles already received (skip list)
+status                 — "ACTIVE" | "PAUSED" | "CANCELLED" | "NEEDS_MANUAL_REVIEW"
 rotationGroupId
 ```
 
-**uniqueKey** prevents duplicate instances. It incorporates the original order ID so each new subscription purchase gets a fresh instance even for the same customer/product.
+**uniqueKey** prevents duplicate instances. It incorporates the order ID so each subscription purchase/renewal-that-creates-an-instance gets a fresh row.
+
+**`purchasedProductIds` / `purchasedProductTitles`** — the skip list, kept in BOTH forms so the DB is self-documenting. Both are maintained together (seeded from the first order, backfilled from order history for old subscriptions, appended after each rotation, and reset to `[]` once the full set has been received). The skip check reads whichever column matches the group's `skipMatchBy`.
+
+**`NEEDS_MANUAL_REVIEW`** — set when an old subscription renewal can't be uniquely attributed (multiple identical old subscriptions). Such instances STILL rotate (with the skip logic) but are left **unfulfilled** and logged as `MANUAL` for a human to verify.
 
 ### `RotationLog`
-Audit trail. One row per rotation attempt (SUCCESS, FAILED, or SKIPPED).
+Audit trail. One row per rotation attempt.
 
 ```
 id (cuid)
@@ -176,8 +191,9 @@ orderId              — GID of the renewal order
 customerId
 targetProductTitle   — what was originally in the order
 rotationProductTitle — what was swapped in
-status               — "SUCCESS" | "FAILED" | "SKIPPED"
-message              — error message for FAILED, skip reason for SKIPPED
+status               — "SUCCESS" | "FAILED" | "SKIPPED" | "MANUAL"
+message              — error message for FAILED, skip reason for SKIPPED,
+                       manual-review notice for MANUAL
 createdAt
 ```
 
@@ -187,65 +203,87 @@ createdAt
 
 ## 5. Core Rotation Logic
 
-**Entry point:** `app/services/rotation.server.js` → `processOrderWebhook(shop, order, admin)`
+**File:** `app/services/rotation.server.js`. There are **two entry points**, because the Loop renewal order itself does **not** carry the subscription contract id — so it can't be routed to the right subscription on `orders/create`.
 
-### Flow on `orders/create` webhook
+### Why two entry points
 
-```
-1. Upsert ShopSetting for the shop.
+A renewal order has no contract id, and Shopify won't let this app read Loop's `SubscriptionContract` (the `read_own_subscription_contracts` scope only covers contracts the app itself created). Two same-product subscriptions of one customer are therefore indistinguishable on the order alone. The contract id only arrives via a Loop **Flow** call. So:
 
-2. Determine if this is a Loop renewal:
-   order.source_name === "subscription_contract_checkout_one"
+- `orders/create` handles **first purchases** (creates the instance, never edits the order) and **defers all renewals**.
+- A Loop Flow ("Subscription billing attempt success") calls **`/api/subscription-contract-activated`** on every renewal with `{ contractId, orderId, customerId, shop }`. That endpoint fetches the order and calls **`processRenewalForContract()`**, which routes strictly by contract id and does the rotation.
 
-3. For each active RotationGroup:
-   a. Find line items in the order matching targetProductId.
-   b. If no matching line items → skip this group.
-
-4. NEW SUBSCRIPTION PURCHASE (not a renewal):
-   - Cancel any stale ACTIVE instances for this customer+product
-     (catches Loop cancellations that didn't send our webhook).
-   - Create a fresh SubscriptionInstance with currentIndex=0.
-   - Do NOT edit the order (first order keeps the original product).
-
-5. RENEWAL ORDER:
-   a. Find existing SubscriptionInstance via contractId or customerId+product.
-   b. If none exists → create one (handles renewal arriving before first order).
-   c. Idempotency check: if a RotationLog already exists for this order+customer → skip.
-   d. Call rotateOrderItems().
-
-6. After all groups processed → pruneOldLogs() (non-blocking).
-```
-
-### `rotateOrderItems()`
+### `processOrderWebhook(shop, order, admin)` — `orders/create`
 
 ```
-1. Get activeItems = group.rotationItems.filter(isActive), sorted by sortOrder.
-2. If empty → log SKIPPED "No active rotation items".
-3. nextIndex = instance.currentIndex % activeItems.length
-4. nextItem = activeItems[nextIndex]
-5. newIndex = (nextIndex + 1) % activeItems.length
-
-6. SELF-ROTATION GUARD:
-   If nextItem.productId === group.targetProductId:
-   → advance index, log SKIPPED "Rotation item is the target product", return.
-
-7. Call performOrderEdit() (see Section 6).
-8. Update instance.currentIndex = newIndex.
-9. Log SUCCESS.
-
-10. ERROR HANDLING:
-    - err.concurrent = true → silent return (another webhook run got there first).
-    - Any other error → log FAILED, rethrow.
+1. Upsert ShopSetting.
+2. For each active RotationGroup with matching target line items:
+   - NOT a Loop renewal (first purchase): create a fresh SubscriptionInstance,
+     seeding purchasedProductIds/Titles from any rotation products already in the
+     first order. Do NOT edit the order.
+   - Loop renewal: DEFER — log and skip (rotation happens in the Flow endpoint).
+3. pruneOldLogs().
 ```
 
-### `extractContractId(order)`
-Scans `order.note_attributes[]` and all line item `properties[]` for a value matching the pattern `gid://shopify/SubscriptionContract/\d+`. This is how Loop embeds the subscription contract GID in the order.
+### `processRenewalForContract(shop, order, admin, contractId)` — the Flow endpoint
+
+```
+For each active RotationGroup with matching target line items:
+
+1. RESOLVE THE INSTANCE (matching priority):
+   a. Exact match by subscriptionContractId → same subscription, continue rotation.
+   b. Adopt a single UNLINKED first-order instance (contractId still null) matched by
+      fingerprint → bind the contract id to it.
+   c. Otherwise it's an OLD pre-install subscription → BACKFILL:
+      - Ambiguity check: another linked contract exists for this customer+product, OR
+        >1 unlinked candidate → cannot uniquely identify → status = NEEDS_MANUAL_REVIEW.
+      - Backfill purchasedProductIds/Titles from the customer's order history.
+      - Create the instance (status ACTIVE, or NEEDS_MANUAL_REVIEW if ambiguous).
+
+2. Idempotency: if a RotationLog already exists for this order → skip.
+3. Lazy backfill: if either purchased column is null, seed both from history (also
+   migrates legacy rows that stored a title in purchasedProductIds).
+4. Call rotateOrderItems().
+```
+
+### `rotateOrderItems()` — selection, skip, and persistence
+
+```
+1. activeItems = group.rotationItems (active, sorted). If empty → log SKIPPED.
+2. SKIP LOGIC (skipMatchBy = PRODUCT_ID | PRODUCT_TITLE):
+   - Read the purchased set from the matching column (ids or lowercased titles).
+   - Walk forward from currentIndex to the first product NOT yet received.
+   - If ALL have been received → stop skipping and rotate from currentIndex (cycle
+     starts over).
+3. SELF-ROTATION GUARD: if the selected product === target product → advance + log
+   SKIPPED, return.
+4. OPTIMISTIC LOCK (atomic updateMany on currentIndex + lastProcessedOrderId):
+   advances currentIndex, stamps the order, and writes BOTH purchased columns
+   (append selected; reset both to [] when the full set is now covered). Rolled back
+   on failure.
+5. performOrderEdit() (see Section 6).
+6. autoFulfillRotationItems() — ONLY if the selected product's effective auto-fulfill
+   is on (nextItem.autoFulfill ?? group.autoFulfill) AND the instance is not
+   NEEDS_MANUAL_REVIEW. Manual-review rotations are always left unfulfilled.
+7. Log SUCCESS (or MANUAL for a NEEDS_MANUAL_REVIEW instance, with the manual-review
+   message). On error: roll back, log FAILED. err.concurrent → silent return / additive
+   retry for already-fulfilled orders.
+```
+
+### Helpers
+- **`extractContractId(order)`** — scans `note_attributes[]` / line item `properties[]` for `gid://shopify/SubscriptionContract/\d+`. In practice Loop renewal orders don't include it, which is why the Flow endpoint supplies it.
+- **`fetchOrderForRotation(admin, orderId)`** — fetches a renewal order via the Admin API and maps it to the `orders/create` payload shape so the rotation + order-edit code can consume it.
+- **`fetchCustomerOrdersLight` / `receivedRotationProducts`** — read the customer's order history (`read_orders`) and collect which rotation-group products were already received (as both ids and titles), scoped to subscription-related orders (Loop renewals or orders containing the target product).
 
 ---
 
 ## 6. Order Edit Flow
 
-**File:** `app/services/order-edit.server.js` → `performOrderEdit({ admin, orderGid, targetLineItems, nextItem, currency })`
+**File:** `app/services/order-edit.server.js` → `performOrderEdit({ admin, orderGid, targetLineItems, nextItem, currency, freeRotation, keepTargetProduct, skipZeroOut })`
+
+**Flags:**
+- `freeRotation` — apply a 100% discount so the rotation product is free to the customer.
+- `keepTargetProduct` — do NOT zero out the original subscription product; leave it in the order and just add the rotation product alongside it (no remove + re-add churn).
+- `skipZeroOut` — additive-retry mode: used when the first attempt's commit fails because the order is already fulfilled (Shopify rejects removing fulfilled line items). Adds the rotation product without removing the original.
 
 ### Step 1: Determine Case 1 vs Case 2
 
@@ -260,6 +298,8 @@ Scans `order.note_attributes[]` and all line item `properties[]` for a value mat
 
 ### Step 3: Zero out target line items
 For each subscription line item → `orderEditSetQuantity(calcLineItemId, 0)`.
+
+**Skipped when `keepTargetProduct` or `skipZeroOut` is set** — the original product is left in the order (kept intentionally, or because it's already fulfilled and can't be removed).
 
 **Concurrent webhook guard:** If the mutation returns "cannot be edited because it is removed" → another webhook run already zeroed this item → throw `err.concurrent = true`.
 
@@ -300,7 +340,8 @@ Loop subscription orders set `final_line_price = "0.00"` on renewal. So:
 | `app.rotation-groups._index.jsx` | `/app/rotation-groups` | List all rotation groups with status/item count |
 | `app.rotation-groups.new.jsx` | `/app/rotation-groups/new` | Search & select target product, create group |
 | `app.rotation-groups.$id.jsx` | `/app/rotation-groups/:id` | Edit group: target product image, status toggle, rotation sequence, add/remove/reorder items |
-| `app.rotation-logs._index.jsx` | `/app/rotation-logs` | Paginated audit log with status filter |
+| `app.rotation-logs._index.jsx` | `/app/rotation-logs` | Paginated audit log with status filter (SUCCESS/FAILED/SKIPPED/MANUAL) |
+| `api.subscription-contract-activated.jsx` | `/api/subscription-contract-activated` | **Loop Flow endpoint** — called on every renewal with `{ contractId, orderId, customerId, shop }`; runs contract-authoritative renewal rotation. Auth via `x-rotation-secret` header (`LOOP_CANCEL_SECRET`). |
 | `auth.$.jsx` | `/auth/*` | OAuth callback handler |
 | `auth.login/route.jsx` | `/auth/login` | Login page; includes exit-iframe fix for OAuth redirect |
 
@@ -308,7 +349,7 @@ Loop subscription orders set `final_line_price = "0.00"` on renewal. So:
 
 | `intent` value | What it does |
 |---|---|
-| `updateGroup` | Toggle `isActive` on the group |
+| `updateGroup` | Save group settings: `isActive`, `freeRotation`, `keepTargetProduct`, `autoFulfill`, `skipMatchBy` (resets instances' purchased lists if `skipMatchBy` changed) |
 | `deleteGroup` | Delete group (cascades to rotation items) → redirect to list |
 | `addItem` | Add a rotation item at the end of the sequence |
 | `toggleItem` | Toggle `isActive` on a single item |
@@ -319,8 +360,8 @@ Loop subscription orders set `final_line_price = "0.00"` on renewal. So:
 
 ## 8. Webhook Handlers
 
-### `webhooks.orders.create.jsx` ← most important
-Triggers rotation. Calls `processOrderWebhook(shop, order, admin)`.
+### `webhooks.orders.create.jsx`
+Calls `processOrderWebhook(shop, order, admin)`. Handles **first purchases** (creates the instance, no edit) and **defers renewals** — renewal rotation is driven by the Loop Flow endpoint `/api/subscription-contract-activated` (Section 7), which is the only place the subscription contract id is available.
 
 HMAC signature is verified automatically by the Shopify middleware (`authenticate.webhook`). The webhook is registered in `shopify.app.toml`.
 
@@ -502,18 +543,21 @@ The `npm run dev` command uses the Shopify CLI to:
 Before going live:
 
 - [ ] Set `expiringOfflineAccessTokens: true` in `shopify.server.js`
-- [ ] Switch `DATABASE_URL` to a production Postgres database
-- [ ] Run `npx prisma migrate deploy` on production DB
-- [ ] Confirm all webhook endpoints are registered and receiving events
+- [ ] Switch `DATABASE_URL` to a production Postgres database (+ `DIRECT_URL`)
+- [ ] Schema is synced on deploy by `vercel-build` (`prisma db push`) — adds new columns automatically. (Nullable columns only, so no data loss.)
+- [ ] **Configure the Loop Flow** ("Subscription billing attempt success" trigger) to POST `{ contractId, orderId, customerId, shop }` to `/api/subscription-contract-activated` with the `x-rotation-secret` header. Renewals do NOT rotate without this.
+- [ ] Set `LOOP_CANCEL_SECRET` env var to match the Flow's `x-rotation-secret`.
 - [ ] Test a full rotation cycle: subscribe → renewal → product swap → check for refund
+- [ ] Test the skip logic in both `skipMatchBy` modes (PRODUCT_ID and PRODUCT_TITLE)
+- [ ] Test an old (pre-install) subscription renewal: backfill from history → correct skip
+- [ ] Test multiple identical subscriptions for one customer → MANUAL review, rotated but unfulfilled
 - [ ] Test with qty > 1 line items (the fractional-cent edge case)
 - [ ] Test concurrent webhook delivery (Loop often fires twice; both should succeed without duplicate edits)
-- [ ] Verify the `orders/create` webhook is live in Shopify Partner Dashboard
 - [ ] Confirm `SHOPIFY_APP_URL` points to production host (not ngrok)
 - [ ] Consider raising the RotationLog cap from 50 rows / 7 days if more history is needed
 - [ ] Test the exit-iframe OAuth flow in production (session expiry → re-auth should not break the embedded app)
 
 ---
 
-*Last updated: June 2026*
+*Last updated: June 2026 — renewal rotation is contract-authoritative via the Loop Flow endpoint; persisted skip lists (`purchasedProductIds` / `purchasedProductTitles`) with `skipMatchBy`; old-subscription backfill + `NEEDS_MANUAL_REVIEW` safety.*
 *Developer: coderapurba*

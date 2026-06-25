@@ -142,6 +142,20 @@ export const action = async ({ request, params }) => {
     return null;
   }
 
+  if (intent === "toggleItemAutoFulfill") {
+    const itemId = fd.get("itemId");
+    const item = await db.rotationItem.findUnique({
+      where: { id: itemId },
+      include: { rotationGroup: { select: { autoFulfill: true } } },
+    });
+    if (item) {
+      // Flip the EFFECTIVE value (item override, else group default) and store it explicitly.
+      const effective = item.autoFulfill ?? item.rotationGroup.autoFulfill;
+      await db.rotationItem.update({ where: { id: itemId }, data: { autoFulfill: !effective } });
+    }
+    return null;
+  }
+
   if (intent === "deleteItem") {
     const itemId = fd.get("itemId");
     await db.rotationItem.delete({ where: { id: itemId } });
@@ -400,15 +414,15 @@ function GroupSettingsSection({ group }) {
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke={autoFulfill ? "#008060" : "#6d7175"} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
                 <polyline points="20 6 9 17 4 12"/>
               </svg>
-              <span style={{ fontSize: "13px", fontWeight: "600", color: "#303030" }}>Auto-Fulfill Rotation Products</span>
+              <span style={{ fontSize: "13px", fontWeight: "600", color: "#303030" }}>Auto-Fulfill Rotation Products (default)</span>
               {autoFulfill && (
                 <span style={{ fontSize: "10px", fontWeight: "700", color: "#008060", background: "#c9f0e1", padding: "2px 7px", borderRadius: "10px", letterSpacing: "0.4px", textTransform: "uppercase" }}>ON</span>
               )}
             </div>
             <div style={{ fontSize: "12px", color: "#6d7175", lineHeight: "1.5", paddingLeft: "24px" }}>
               {autoFulfill
-                ? "Rotation products will be automatically marked as fulfilled after being added to the order."
-                : "Rotation products are added to the order as unfulfilled — fulfill manually or via another app."}
+                ? "Default for rotation products: automatically marked as fulfilled after being added. Each product can override this in the rotation sequence below."
+                : "Default for rotation products: added as unfulfilled — fulfill manually. Each product can override this in the rotation sequence below."}
             </div>
           </div>
 
@@ -513,6 +527,7 @@ function RotationSequenceSection({ group }) {
                 <th style={th}>Default Variant</th>
                 <th style={th}>Price</th>
                 <th style={th}>Status</th>
+                <th style={th}>Auto-Fulfill</th>
                 <th style={th}>Actions</th>
               </tr>
             </thead>
@@ -524,6 +539,7 @@ function RotationSequenceSection({ group }) {
                   idx={idx}
                   isFirst={idx === 0}
                   isLast={idx === group.rotationItems.length - 1}
+                  groupAutoFulfill={group.autoFulfill ?? false}
                 />
               ))}
             </tbody>
@@ -577,10 +593,13 @@ function ConfirmModal({ isOpen, icon, title, message, confirmLabel, confirmStyle
 
 // ─── Item Row ─────────────────────────────────────────────────────────────────
 
-function RotationItemRow({ item, idx, isFirst, isLast }) {
+function RotationItemRow({ item, idx, isFirst, isLast, groupAutoFulfill }) {
   const fetcher = useFetcher();
   const [showRemoveModal, setShowRemoveModal] = useState(false);
   const isBusy = fetcher.state !== "idle";
+  // Effective auto-fulfill = item override, falling back to the group default.
+  const itemFulfill = item.autoFulfill ?? groupAutoFulfill;
+  const isOverridden = item.autoFulfill != null;
 
   const submit = (intent, extra = {}) => {
     fetcher.submit({ intent, itemId: item.id, ...extra }, { method: "post" });
@@ -638,6 +657,30 @@ function RotationItemRow({ item, idx, isFirst, isLast }) {
           <span style={item.isActive ? badgeActive : badgeInactive}>
             {item.isActive ? "Active" : "Paused"}
           </span>
+        </td>
+        <td style={td}>
+          <div
+            onClick={() => !isBusy && submit("toggleItemAutoFulfill")}
+            title={
+              (itemFulfill ? "Auto-fulfill ON" : "Auto-fulfill OFF") +
+              (isOverridden ? " (per-product override)" : " (inherited from group default)")
+            }
+            style={{
+              position: "relative", width: "40px", height: "23px", borderRadius: "12px", flexShrink: 0,
+              background: itemFulfill ? "#008060" : "#c9cccf",
+              cursor: isBusy ? "default" : "pointer", opacity: isBusy ? 0.6 : 1,
+              transition: "background 0.2s",
+            }}
+          >
+            <div style={{
+              position: "absolute", top: "3px", left: itemFulfill ? "20px" : "3px",
+              width: "17px", height: "17px", borderRadius: "50%", background: "#fff",
+              boxShadow: "0 1px 3px rgba(0,0,0,0.25)", transition: "left 0.2s",
+            }} />
+          </div>
+          <div style={{ fontSize: "10px", color: isOverridden ? "#008060" : "#8c9196", marginTop: "3px" }}>
+            {isOverridden ? "Override" : "Default"}
+          </div>
         </td>
         <td style={{ ...td, whiteSpace: "nowrap" }}>
           <div style={{ display: "flex", gap: "4px", alignItems: "center" }}>

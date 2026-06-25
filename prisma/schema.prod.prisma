@@ -68,6 +68,7 @@ model RotationItem {
   variantTitle    String?
   sortOrder       Int
   isActive        Boolean  @default(true)
+  autoFulfill     Boolean? // per-product auto-fulfill override; null = inherit RotationGroup.autoFulfill
   imageUrl        String?
   price           String?
   createdAt       DateTime @default(now())

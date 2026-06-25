@@ -283,7 +283,10 @@ async function rotateOrderItems(shop, orderGid, instance, group, targetLineItems
   // left UNFULFILLED and logged as MANUAL so a human can verify before fulfilling (spec #6).
   const isManual = instance.status === STATUS_MANUAL;
   const successStatus = isManual ? "MANUAL" : "SUCCESS";
-  const allowFulfill = (group.autoFulfill ?? false) && !isManual;
+  // Auto-fulfill is per rotation product (nextItem.autoFulfill), falling back to the group
+  // default when the product hasn't overridden it. Never auto-fulfill a manual-review order.
+  const itemAutoFulfill = nextItem.autoFulfill ?? group.autoFulfill ?? false;
+  const allowFulfill = itemAutoFulfill && !isManual;
 
   try {
     await performOrderEdit({
