@@ -331,21 +331,22 @@ async function rotateOrderItems(shop, orderGid, instance, group, targetLineItems
   const isManual = instance.status === STATUS_MANUAL;
   const successStatus = isManual ? "MANUAL" : "SUCCESS";
 
-  // Auto-fulfill each sent product whose effective auto-fulfill (item override, else group
-  // default) is on. Never auto-fulfill a manual-review order.
+  // Auto-fulfill the sent products whose effective auto-fulfill (item override, else group
+  // default) is on — all in ONE call (see autoFulfillRotationItems for why per-product calls
+  // break multi-product batches). Never auto-fulfill a manual-review order.
   const fulfillBatch = async () => {
     if (isManual) {
       console.log(`[rotation] order=${orderGid} NEEDS_MANUAL_REVIEW — rotation products added but left UNFULFILLED`);
       return;
     }
-    for (const item of batchItems) {
-      const itemAutoFulfill = item.autoFulfill ?? group.autoFulfill ?? false;
-      if (!itemAutoFulfill) continue;
-      try {
-        await autoFulfillRotationItems(admin, orderGid, item.productId);
-      } catch (fulfillErr) {
-        console.warn(`[rotation] order=${orderGid} autoFulfill error for product=${idOf(item)} (non-fatal): ${fulfillErr.message}`);
-      }
+    const fulfillIds = batchItems
+      .filter((item) => (item.autoFulfill ?? group.autoFulfill ?? false))
+      .map((item) => item.productId);
+    if (fulfillIds.length === 0) return;
+    try {
+      await autoFulfillRotationItems(admin, orderGid, fulfillIds);
+    } catch (fulfillErr) {
+      console.warn(`[rotation] order=${orderGid} autoFulfill error (non-fatal): ${fulfillErr.message}`);
     }
   };
 
