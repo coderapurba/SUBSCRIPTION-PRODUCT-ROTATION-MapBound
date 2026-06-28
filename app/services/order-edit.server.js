@@ -152,6 +152,26 @@ async function addFixedDiscount(admin, calcOrderId, lineItemId, amount, currency
   }
 }
 
+// Adds a CUSTOM line item with an arbitrary price (in the order's presentment currency).
+// Used when a rotation product's real price is BELOW the amount it must be charged — Shopify
+// can only discount a real variant, never surcharge it, so to make the rotation total equal
+// the subscription price we add a price-override line instead. NOTE: a custom item isn't
+// linked to the product variant, so inventory and app-based digital delivery don't apply to it.
+async function addCustomItem(admin, calcOrderId, title, amount, currencyCode, quantity = 1) {
+  const data = await gql(admin, `
+    mutation OrderEditAddCustomItem($id: ID!, $title: String!, $quantity: Int!, $price: MoneyInput!) {
+      orderEditAddCustomItem(id: $id, title: $title, quantity: $quantity, price: $price, requiresShipping: true, taxable: false) {
+        calculatedLineItem { id }
+        userErrors { field message }
+      }
+    }
+  `, { id: calcOrderId, title, quantity, price: { amount: amount.toFixed(2), currencyCode } });
+
+  const errors = data?.data?.orderEditAddCustomItem?.userErrors;
+  if (errors?.length) throw new Error(`orderEditAddCustomItem: ${errors[0].message}`);
+  return data?.data?.orderEditAddCustomItem?.calculatedLineItem?.id;
+}
+
 async function commitOrderEdit(admin, calcOrderId) {
   const data = await gql(admin, `
     mutation OrderEditCommit($id: ID!) {
@@ -206,54 +226,26 @@ function lineTotal(li) {
   return linePrice - totalDiscount;
 }
 
-// Distribute `totalCents` across products as EVENLY as possible without any product exceeding
-// its cap (its real catalog price, in cents). Returns the charge (in cents) for each product.
-// Water-filling: hand out the remaining amount evenly to products that still have headroom,
-// repeating until it's all distributed (a cheap product takes only up to its cap; the rest
-// flows to the others). sum(result) === min(totalCents, sum(caps)) — so the order total equals
-// the subscription price whenever the batch's combined real price can cover it (it can't be
-// exceeded because Shopify order edits only discount, never surcharge).
-function allocateEven(totalCents, caps) {
-  const n = caps.length;
-  const charges = new Array(n).fill(0);
-  const capSum = caps.reduce((s, c) => s + c, 0);
-  let remaining = Math.min(Math.max(0, totalCents), capSum);
-
-  let guard = 0;
-  while (remaining > 0 && guard++ < 1000000) {
-    const active = [];
-    for (let i = 0; i < n; i++) if (charges[i] < caps[i]) active.push(i);
-    if (active.length === 0) break;
-
-    const per = Math.floor(remaining / active.length);
-    if (per === 0) {
-      // Hand out the last few cents one at a time to products with headroom.
-      for (let k = 0; k < active.length && remaining > 0; k++) {
-        charges[active[k]] += 1;
-        remaining -= 1;
-      }
-      continue;
-    }
-    for (const i of active) {
-      const give = Math.min(per, caps[i] - charges[i]);
-      charges[i] += give;
-      remaining -= give;
-    }
-  }
-  return charges;
-}
-
 // ─── Auto-fulfill ─────────────────────────────────────────────────────────────
 
-// Accepts a single product id/GID or an ARRAY of them. All matching products are fulfilled in
-// ONE fulfillmentCreateV2 call — fulfilling them one-by-one fails for multi-product batches
-// because fulfilling the first product moves the shared fulfillment order out of "OPEN", so a
-// subsequent per-product call finds no open fulfillment order and silently skips the rest.
-export async function autoFulfillRotationItems(admin, orderGid, rotationProductIds) {
-  const ids = Array.isArray(rotationProductIds) ? rotationProductIds : [rotationProductIds];
-  const productGids = new Set(
-    ids.map((id) => (String(id).startsWith("gid://") ? String(id) : `gid://shopify/Product/${id}`))
-  );
+// Accepts an ARRAY of rotation targets — each either a product id/GID string, or an object
+// { productId, title }. All matching line items are fulfilled in ONE fulfillmentCreateV2 call
+// (fulfilling them one-by-one fails for multi-product batches: fulfilling the first product
+// moves the shared fulfillment order out of "OPEN", so a subsequent per-product call finds no
+// open fulfillment order and silently skips the rest). Matching is by product GID for real
+// products, OR by line item title for custom price-override lines (which have no product).
+export async function autoFulfillRotationItems(admin, orderGid, targets) {
+  const list = Array.isArray(targets) ? targets : [targets];
+  const productGids = new Set();
+  const titles = new Set();
+  for (const t of list) {
+    if (typeof t === "string") {
+      productGids.add(t.startsWith("gid://") ? t : `gid://shopify/Product/${t}`);
+    } else if (t) {
+      if (t.productId) productGids.add(String(t.productId).startsWith("gid://") ? String(t.productId) : `gid://shopify/Product/${t.productId}`);
+      if (t.title) titles.add(t.title);
+    }
+  }
 
   const data = await gql(admin, `
     query GetFulfillmentOrders($orderId: ID!) {
@@ -267,6 +259,7 @@ export async function autoFulfillRotationItems(admin, orderGid, rotationProductI
                 id
                 remainingQuantity
                 lineItem {
+                  title
                   variant { product { id } }
                 }
               }
@@ -282,9 +275,12 @@ export async function autoFulfillRotationItems(admin, orderGid, rotationProductI
   const toFulfill = [];
   for (const fo of fulfillmentOrders) {
     if (fo.status !== "OPEN") continue;
-    const matching = (fo.lineItems?.nodes ?? []).filter(
-      (li) => productGids.has(li.lineItem?.variant?.product?.id) && li.remainingQuantity > 0
-    );
+    const matching = (fo.lineItems?.nodes ?? []).filter((li) => {
+      if ((li.remainingQuantity ?? 0) <= 0) return false;
+      const pid = li.lineItem?.variant?.product?.id;
+      const title = li.lineItem?.title;
+      return (pid && productGids.has(pid)) || (title && titles.has(title));
+    });
     if (matching.length > 0) {
       toFulfill.push({
         fulfillmentOrderId: fo.id,
@@ -294,7 +290,7 @@ export async function autoFulfillRotationItems(admin, orderGid, rotationProductI
   }
 
   if (toFulfill.length === 0) {
-    console.log(`[order-edit] autoFulfill: no open fulfillment order found for products=[${[...productGids].join(", ")}] on order=${orderGid}`);
+    console.log(`[order-edit] autoFulfill: no open fulfillment order found for products=[${[...productGids].join(", ")}] titles=[${[...titles].join(", ")}] on order=${orderGid}`);
     return;
   }
 
@@ -398,41 +394,60 @@ export async function performOrderEdit({ admin, orderGid, targetLineItems, batch
 
   // ── 4. Add rotation items with correct pricing ────────────────────────────
   //
-  // Shopify's orderEditAddLineItemDiscount fixedValue is applied PER UNIT.
-  // For qty > 1 with a non-divisible total (e.g. 49.97 for qty=2 → 24.985/unit),
-  // a single multi-unit add always rounds to 49.96 or 49.98.
-  //
-  // Fix: split every quantity into individual qty=1 adds, distributing the
-  // 1-cent remainder to the last unit so the line total is always exact.
-  // Uses integer-cent arithmetic throughout to avoid floating-point drift.
+  // addRotationLine adds ONE qty-1 rotation unit charged EXACTLY `chargeCents`:
+  //   • real price ≥ charge → add the real variant + discount it down. Keeps the product
+  //     variant link (inventory, app-based digital delivery, product-based auto-fulfill).
+  //   • real price < charge → Shopify can't surcharge a variant, so remove the just-added
+  //     variant and add a CUSTOM price-override line at the exact charge (merchant's choice).
+  //     This is the only way to make the rotation total equal the subscription price when a
+  //     product is cheaper than what it must be charged.
+  // free=true → 100% discount (charge 0); always keeps the real variant.
+  // All arithmetic is in integer cents of the order's PRESENTMENT currency (the price addVariant
+  // returns), so the result is correct for every currency.
+  async function addRotationLine(variantId, chargeCents, displayTitle, free = freeRotation) {
+    const targetCents = free ? 0 : chargeCents;
 
-  // free=true  → 100% discount (rotation product when freeRotation is on)
-  // free=false → price-match what customer paid (rotation product normally, or re-added target)
-  async function addUnitsExact(variantId, targetLineItem, title, free = freeRotation) {
-    const totalCents    = Math.round(lineTotal(targetLineItem) * 100);
-    const baseUnitCents = Math.floor(totalCents / targetLineItem.quantity);
+    const { id: newId, unitPrice, currencyCode: variantCurrency } =
+      await addVariant(admin, calcOrderId, variantId, 1);
+    const cur = variantCurrency ?? currency;
+    const variantCents = Math.round(unitPrice * 100);
 
-    for (let i = 0; i < targetLineItem.quantity; i++) {
-      const isLast    = i === targetLineItem.quantity - 1;
-      const unitCents = isLast ? totalCents - baseUnitCents * i : baseUnitCents;
-
-      const { id: newId, unitPrice, currencyCode: variantCurrency } =
-        await addVariant(admin, calcOrderId, variantId, 1);
-
-      const variantCents  = Math.round(unitPrice * 100);
-      const discountCents = free ? variantCents : variantCents - unitCents;
-      const discountAmt   = discountCents / 100;
-
+    if (variantCents >= targetCents) {
+      const discountCents = variantCents - targetCents;
       console.log(
-        `[order-edit] ${title} unit=${i+1}/${targetLineItem.quantity} ` +
-        `paidPrice=${(unitCents/100).toFixed(2)} variantPrice=${unitPrice.toFixed(2)} ` +
-        `discount=${discountAmt.toFixed(4)} currency=${variantCurrency ?? currency}` +
-        (free ? " [FREE]" : "")
+        `[order-edit] ${displayTitle} REAL charge=${(targetCents / 100).toFixed(2)} ` +
+        `variantPrice=${unitPrice.toFixed(2)} discount=${(discountCents / 100).toFixed(2)} ` +
+        `currency=${cur}${free ? " [FREE]" : ""}`
       );
-
-      if (discountAmt > 0) {
-        await addFixedDiscount(admin, calcOrderId, newId, discountAmt, variantCurrency ?? currency);
+      if (discountCents > 0) {
+        await addFixedDiscount(admin, calcOrderId, newId, discountCents / 100, cur);
       }
+    } else {
+      // Product cheaper than the required charge → replace with a custom price-override line.
+      const removed = await setLineItemQuantity(admin, calcOrderId, newId, 0);
+      if (!removed) {
+        const err = new Error("Order already processed by concurrent webhook run");
+        err.concurrent = true;
+        throw err;
+      }
+      await addCustomItem(admin, calcOrderId, displayTitle, targetCents / 100, cur);
+      console.log(
+        `[order-edit] ${displayTitle} CUSTOM charge=${(targetCents / 100).toFixed(2)} ` +
+        `(real price ${unitPrice.toFixed(2)} < charge — price-override line) currency=${cur}`
+      );
+    }
+  }
+
+  // Add one rotation PRODUCT priced to `chargeCents`, split into qty-1 units across the matching
+  // target line item's quantity (the per-unit cent remainder goes to the last unit so the line
+  // total is always exact). chargeCents here is the FULL amount for that target line item.
+  async function addProductForLineItem(variantId, targetLineItem, chargeCents, displayTitle, free = freeRotation) {
+    const qty = targetLineItem.quantity;
+    const baseUnitCents = Math.floor(chargeCents / qty);
+    for (let i = 0; i < qty; i++) {
+      const isLast = i === qty - 1;
+      const unitCents = isLast ? chargeCents - baseUnitCents * (qty - 1) : baseUnitCents;
+      await addRotationLine(variantId, unitCents, displayTitle, free);
     }
   }
 
@@ -443,61 +458,30 @@ export async function performOrderEdit({ admin, orderGid, targetLineItems, batch
         const title = li.variant_title || "Default Title";
         const match = nextVariantTitleMap.get(title);
         if (!match) continue;
-
-        await addUnitsExact(match.id, li, `case2 variant=${title}`);
+        await addProductForLineItem(match.id, li, Math.round(lineTotal(li) * 100), nextItem.productTitle);
       }
     } else {
       // Case 1: rotation product uses its default variant
       for (const li of targetLineItems) {
-        await addUnitsExact(nextItem.variantId, li, `case1`);
+        await addProductForLineItem(nextItem.variantId, li, Math.round(lineTotal(li) * 100), nextItem.productTitle);
       }
     }
   } else {
     // ── Multi-product batch: even split that totals EXACTLY the subscription price ──
-    // The original subscription total (sum of all target line item totals, in presentment
-    // cents) is distributed across the batch products so the order total stays exactly what the
-    // customer pays — no refund. Each product is charged as evenly as possible but NEVER more
-    // than its real catalog price (Shopify order edit can only discount, not surcharge). Any
-    // share a cheaper product can't absorb is redistributed to the products that still have
-    // headroom (water-filling). All arithmetic is in integer cents of the order's presentment
-    // currency (the price addVariant returns), so it's correct for every currency.
+    // The original subscription total (sum of all target line item totals, in presentment cents)
+    // is split EVENLY across the batch products (the last product absorbs the remainder cent so
+    // the order total is exactly what the customer pays — no refund). Each product is added at
+    // qty 1; products priced at/above their share keep their real variant, cheaper ones become a
+    // custom price-override line (see addRotationLine).
     const totalCents = targetLineItems.reduce((sum, li) => sum + Math.round(lineTotal(li) * 100), 0);
+    const N = batch.length;
+    const baseShareCents = Math.floor(totalCents / N);
 
-    // 1. Add each product (qty 1) and capture its real per-unit price + currency.
-    const added = [];
-    for (const item of batch) {
-      const { id, unitPrice, currencyCode } = await addVariant(admin, calcOrderId, item.variantId, 1);
-      added.push({
-        item,
-        lineItemId: id,
-        realCents: Math.round(unitPrice * 100),
-        unitPrice,
-        currencyCode: currencyCode ?? currency,
-      });
-    }
-
-    // 2. Allocate what each product is CHARGED.
-    //    free → everything is free; otherwise water-fill totalCents across the real prices.
-    const charges = freeRotation
-      ? added.map(() => 0)
-      : allocateEven(totalCents, added.map((a) => a.realCents));
-
-    // 3. Apply discount = realPrice − charge for each product.
-    for (let i = 0; i < added.length; i++) {
-      const a = added[i];
-      const discountCents = a.realCents - charges[i];
-      const discountAmt   = discountCents / 100;
-
-      console.log(
-        `[order-edit] batch ${i + 1}/${added.length} product=${String(a.item.productId).split("/").pop()} ` +
-        `charge=${(charges[i] / 100).toFixed(2)} variantPrice=${a.unitPrice.toFixed(2)} ` +
-        `discount=${discountAmt.toFixed(2)} currency=${a.currencyCode}` +
-        (freeRotation ? " [FREE]" : "")
-      );
-
-      if (discountAmt > 0) {
-        await addFixedDiscount(admin, calcOrderId, a.lineItemId, discountAmt, a.currencyCode);
-      }
+    for (let i = 0; i < N; i++) {
+      const item = batch[i];
+      const isLast = i === N - 1;
+      const shareCents = isLast ? totalCents - baseShareCents * (N - 1) : baseShareCents;
+      await addRotationLine(item.variantId, shareCents, item.productTitle, freeRotation);
     }
   }
 

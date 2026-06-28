@@ -339,12 +339,14 @@ async function rotateOrderItems(shop, orderGid, instance, group, targetLineItems
       console.log(`[rotation] order=${orderGid} NEEDS_MANUAL_REVIEW — rotation products added but left UNFULFILLED`);
       return;
     }
-    const fulfillIds = batchItems
+    // Pass product id AND title: real-product lines fulfill by product id, custom
+    // price-override lines (cheaper products) fulfill by title (they have no product).
+    const fulfillTargets = batchItems
       .filter((item) => (item.autoFulfill ?? group.autoFulfill ?? false))
-      .map((item) => item.productId);
-    if (fulfillIds.length === 0) return;
+      .map((item) => ({ productId: item.productId, title: item.productTitle }));
+    if (fulfillTargets.length === 0) return;
     try {
-      await autoFulfillRotationItems(admin, orderGid, fulfillIds);
+      await autoFulfillRotationItems(admin, orderGid, fulfillTargets);
     } catch (fulfillErr) {
       console.warn(`[rotation] order=${orderGid} autoFulfill error (non-fatal): ${fulfillErr.message}`);
     }

@@ -300,14 +300,28 @@ For each active RotationGroup with matching target line items:
 **File:** `app/services/order-edit.server.js` → `performOrderEdit({ admin, orderGid, targetLineItems, batch, currency, freeRotation, keepTargetProduct, skipZeroOut })`
 
 `batch` is the array of rotation products to add this renewal. The function branches on batch size:
-- **`batch.length === 1`** → single-product path (Case 1/Case 2 variant matching + `addUnitsExact` full
-  price-match), described in the steps below. Covers all legacy/single-product groups unchanged.
+- **`batch.length === 1`** → single-product path (Case 1/Case 2 variant matching), described below. Covers
+  all legacy/single-product groups.
 - **`batch.length > 1`** → multi-product even-split path: the original subscription total
   (`Σ round(lineTotal(li)*100)`) is divided **evenly** across the batch products (the last product absorbs
-  the leftover cent so the total is exact). Each product is added at qty 1 using its stored default variant;
-  `discount = freeRotation ? fullPrice : max(0, realPrice − share)`. (Variant-title matching is a 1:1 swap
-  concept that doesn't apply to a curated batch.) Edge: if a product's real price is below its share it
-  simply isn't discounted (order ends slightly under the subscription total).
+  the leftover cent so the order total is exactly the subscription price).
+
+**`addRotationLine(variantId, chargeCents, title, free)`** adds one qty-1 rotation unit charged exactly
+`chargeCents` and is the shared core of both paths (single path wraps it in `addProductForLineItem` to split
+across a target line item's quantity with exact per-unit cents):
+- **real price ≥ charge** → add the **real variant** + discount it down (`addFixedDiscount`). Keeps the
+  product variant link, so inventory, app-based digital delivery, and product-based auto-fulfill all work.
+  This is the trusted, unchanged behaviour.
+- **real price < charge** → Shopify can't surcharge a variant, so the just-added variant is removed
+  (`orderEditSetQuantity` 0) and a **custom price-override line** (`addCustomItem`) is added at the exact
+  charge. This guarantees the rotation total equals the subscription price (no refund) even for a product
+  cheaper than what it must be charged. Trade-off: a custom line isn't linked to the product variant, so
+  inventory and app-based digital delivery (e.g. Digital Downloads) don't apply to it. Auto-fulfill still
+  works because `autoFulfillRotationItems` matches custom lines by **title** (real lines by product GID).
+- **free** → charge 0; always keeps the real variant (100% discount).
+- All arithmetic is in integer cents of the order's **presentment** currency (the price `addVariant`
+  returns), so it's correct for every currency. Custom items are added `taxable: false` — if a store
+  charges tax on the subscription, set this to match to keep the total exact.
 
 **Flags:**
 - `freeRotation` — apply a 100% discount so the rotation product(s) are free to the customer.
