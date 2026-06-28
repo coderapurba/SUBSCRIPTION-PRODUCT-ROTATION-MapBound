@@ -67,6 +67,7 @@ model RotationItem {
   productTitle    String
   variantTitle    String?
   sortOrder       Int
+  stepIndex       Int?     // renewal-step (batch) number; items sharing it are sent together in one renewal. null = legacy singleton (its own step)
   isActive        Boolean  @default(true)
   autoFulfill     Boolean? // per-product auto-fulfill override; null = inherit RotationGroup.autoFulfill
   imageUrl        String?

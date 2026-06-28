@@ -276,17 +276,34 @@ export async function autoFulfillRotationItems(admin, orderGid, rotationProductI
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 
-export async function performOrderEdit({ admin, orderGid, targetLineItems, nextItem, currency, freeRotation = false, keepTargetProduct = false, skipZeroOut = false }) {
-  // ── 1. Case 1 vs Case 2 ────────────────────────────────────────────────────
-  const nextVariants = await getProductVariants(admin, nextItem.productId);
-  const nextVariantTitleMap = new Map(nextVariants.map((v) => [v.title, v]));
+export async function performOrderEdit({ admin, orderGid, targetLineItems, batch, currency, freeRotation = false, keepTargetProduct = false, skipZeroOut = false }) {
+  // `batch` is the array of rotation products to add this renewal.
+  //   • batch.length === 1 → single-product rotation (Case 1/Case 2 variant matching, full
+  //     price-match) — unchanged behaviour, also covers all legacy groups.
+  //   • batch.length  >  1 → multi-product batch: the original subscription price is split
+  //     EVENLY across the products (last absorbs the remainder cent); each added at qty 1
+  //     using its stored default variant.
+  const isSingle = batch.length === 1;
+  const nextItem = batch[0];
 
-  const targetTitles = targetLineItems.map((li) => li.variant_title || "Default Title");
-  const allTitlesMatch =
-    targetTitles.length > 0 &&
-    targetTitles.every((t) => nextVariantTitleMap.has(t));
+  // ── 1. Case 1 vs Case 2 (single-product rotation only) ─────────────────────
+  // Variant-title matching is a 1:1 swap concept; it doesn't apply to a curated multi-product
+  // batch, so we only compute it (and fetch variants) for the single-product case.
+  let nextVariantTitleMap = new Map();
+  let allTitlesMatch = false;
+  if (isSingle) {
+    const nextVariants = await getProductVariants(admin, nextItem.productId);
+    nextVariantTitleMap = new Map(nextVariants.map((v) => [v.title, v]));
 
-  console.log(`[order-edit] order=${orderGid} case=${allTitlesMatch ? "2 (variant match)" : "1 (default variant)"} targetLineItems=${targetLineItems.length}`);
+    const targetTitles = targetLineItems.map((li) => li.variant_title || "Default Title");
+    allTitlesMatch =
+      targetTitles.length > 0 &&
+      targetTitles.every((t) => nextVariantTitleMap.has(t));
+
+    console.log(`[order-edit] order=${orderGid} single-product case=${allTitlesMatch ? "2 (variant match)" : "1 (default variant)"} targetLineItems=${targetLineItems.length}`);
+  } else {
+    console.log(`[order-edit] order=${orderGid} multi-product batch (${batch.length} products) — even price split across batch, targetLineItems=${targetLineItems.length}`);
+  }
 
   // ── 2. Begin edit ──────────────────────────────────────────────────────────
   // Unarchive first — Digital Downloads (and similar apps) auto-fulfill and
@@ -377,19 +394,59 @@ export async function performOrderEdit({ admin, orderGid, targetLineItems, nextI
     }
   }
 
-  if (allTitlesMatch) {
-    // Case 2: rotation product has matching variant titles — swap each variant
-    for (const li of targetLineItems) {
-      const title = li.variant_title || "Default Title";
-      const match = nextVariantTitleMap.get(title);
-      if (!match) continue;
+  if (isSingle) {
+    if (allTitlesMatch) {
+      // Case 2: rotation product has matching variant titles — swap each variant
+      for (const li of targetLineItems) {
+        const title = li.variant_title || "Default Title";
+        const match = nextVariantTitleMap.get(title);
+        if (!match) continue;
 
-      await addUnitsExact(match.id, li, `case2 variant=${title}`);
+        await addUnitsExact(match.id, li, `case2 variant=${title}`);
+      }
+    } else {
+      // Case 1: rotation product uses its default variant
+      for (const li of targetLineItems) {
+        await addUnitsExact(nextItem.variantId, li, `case1`);
+      }
     }
   } else {
-    // Case 1: rotation product uses its default variant
-    for (const li of targetLineItems) {
-      await addUnitsExact(nextItem.variantId, li, `case1`);
+    // ── Multi-product batch: even price split ─────────────────────────────────
+    // The original subscription total (sum of all target line item totals) is divided
+    // EVENLY across the batch products. The last product absorbs the leftover cent so the
+    // order total stays exactly the subscription price. Each product is added at qty 1 using
+    // its stored default variant; integer-cent arithmetic avoids floating-point drift.
+    //
+    // Edge: if a product's real price is below its split share, no surcharge is possible via
+    // order edit, so that product is simply not discounted (order ends up slightly under the
+    // subscription total). Holds true only when batch products are priced below the share —
+    // normal same-tier rotation products are priced at/above it.
+    const totalCents = targetLineItems.reduce((sum, li) => sum + Math.round(lineTotal(li) * 100), 0);
+    const N = batch.length;
+    const baseShareCents = Math.floor(totalCents / N);
+
+    for (let i = 0; i < N; i++) {
+      const item = batch[i];
+      const isLast = i === N - 1;
+      const shareCents = isLast ? totalCents - baseShareCents * (N - 1) : baseShareCents;
+
+      const { id: newId, unitPrice, currencyCode: variantCurrency } =
+        await addVariant(admin, calcOrderId, item.variantId, 1);
+
+      const variantCents  = Math.round(unitPrice * 100);
+      const discountCents = freeRotation ? variantCents : Math.max(0, variantCents - shareCents);
+      const discountAmt   = discountCents / 100;
+
+      console.log(
+        `[order-edit] batch ${i + 1}/${N} product=${String(item.productId).split("/").pop()} ` +
+        `share=${(shareCents / 100).toFixed(2)} variantPrice=${unitPrice.toFixed(2)} ` +
+        `discount=${discountAmt.toFixed(2)} currency=${variantCurrency ?? currency}` +
+        (freeRotation ? " [FREE]" : "")
+      );
+
+      if (discountAmt > 0) {
+        await addFixedDiscount(admin, calcOrderId, newId, discountAmt, variantCurrency ?? currency);
+      }
     }
   }
 

@@ -157,6 +157,35 @@ async function pruneOldLogs(shop) {
   }
 }
 
+// ─── Batches (renewal steps) ────────────────────────────────────────────────────
+//
+// A "renewal step" (batch) is a set of rotation products sent together in ONE renewal.
+// Items sharing the same step are added to the same renewal order.
+//
+// stepOf(item) = item.stepIndex ?? item.sortOrder. New/edited groups store an explicit
+// stepIndex; legacy items (stepIndex null) fall back to sortOrder, so each legacy item
+// becomes its own singleton batch — preserving the original one-product-per-renewal
+// behaviour with no data migration.
+function stepOf(item) {
+  return item.stepIndex != null ? item.stepIndex : item.sortOrder;
+}
+
+// Group active rotation items into ordered batches.
+//   - batches ordered by stepOf ascending
+//   - items within a batch ordered by sortOrder ascending
+// Returns Batch[] where each Batch = { items: RotationItem[] }.
+function buildBatches(items) {
+  const byStep = new Map();
+  for (const item of items) {
+    const key = stepOf(item);
+    if (!byStep.has(key)) byStep.set(key, []);
+    byStep.get(key).push(item);
+  }
+  return [...byStep.keys()]
+    .sort((a, b) => a - b)
+    .map((k) => ({ items: byStep.get(k).slice().sort((a, b) => a.sortOrder - b.sortOrder) }));
+}
+
 // ─── Rotation ─────────────────────────────────────────────────────────────────
 
 async function rotateOrderItems(shop, orderGid, instance, group, targetLineItems, currency, admin) {
@@ -167,17 +196,18 @@ async function rotateOrderItems(shop, orderGid, instance, group, targetLineItems
     return;
   }
 
-  const n = activeItems.length;
+  // currentIndex now indexes BATCHES (renewal steps), not individual items. A batch with
+  // a single product behaves exactly like the old single-product rotation.
+  const batches = buildBatches(activeItems);
+  const n = batches.length;
 
-  // ── Select the next product, skipping ones already received by this subscription ──
-  // purchasedProductIds (persisted on the instance) = numeric productIds this subscription
-  // has already received (seeded from the first order / backfilled from history, then
-  // appended to after each rotation). Walk forward from currentIndex to the first item NOT
-  // yet received. If every rotation product has already been received (full cycle complete),
-  // stop skipping and rotate normally — the cycle starts over and we stop checking.
-  // skipMatchBy controls how "already received" is matched: by product id (default) or by
-  // lowercased product title. We keep BOTH the id list and the title list populated; the
-  // skip check just reads whichever matches the mode.
+  // ── Select the next batch, skipping ones already received by this subscription ──
+  // purchasedProductIds/Titles (persisted on the instance) = products this subscription has
+  // already received. skipMatchBy controls how "already received" is matched (by product id
+  // or by lowercased title). A BATCH counts as received only when ALL of its products are in
+  // the purchased set. Walk forward from currentIndex to the first batch NOT fully received.
+  // If every batch has already been received (full cycle complete), stop skipping and rotate
+  // normally — the cycle starts over.
   const mode = group.skipMatchBy ?? "PRODUCT_ID";
   const idOf = (item) => toNumericId(item.productId);
   const titleOf = (item) => String(item.productTitle ?? "").toLowerCase().trim();
@@ -187,44 +217,44 @@ async function rotateOrderItems(shop, orderGid, instance, group, targetLineItems
   const purchasedTitles = new Set(parsePurchased(instance.purchasedProductTitles));
   const purchasedActive = mode === "PRODUCT_TITLE" ? purchasedTitles : purchasedIds;
 
-  // skipEnabled OFF → don't check already-received; rotate strictly by currentIndex.
+  const batchReceived = (batch) => batch.items.every((it) => purchasedActive.has(keyOf(it)));
+
+  // skipEnabled OFF → don't check already-received; rotate strictly by currentIndex (sequential).
+  // skipEnabled ON  → skip fully-received batches and send the next not-yet-received one.
   const skipEnabled = group.skipEnabled ?? true;
   let selectedIndex = instance.currentIndex % n;
   if (skipEnabled && purchasedActive.size > 0) {
     let found = null;
     for (let step = 0; step < n; step++) {
       const idx = (instance.currentIndex + step) % n;
-      if (purchasedActive.has(keyOf(activeItems[idx]))) {
-        console.log(`[rotation] order=${orderGid} skipping index=${idx} ${mode === "PRODUCT_TITLE" ? `title="${activeItems[idx].productTitle}"` : `product=${idOf(activeItems[idx])}`} — already received by this subscription`);
+      if (batchReceived(batches[idx])) {
+        console.log(`[rotation] order=${orderGid} skipping batch index=${idx} — all products already received by this subscription`);
         continue;
       }
       found = idx;
       break;
     }
     if (found === null) {
-      console.log(`[rotation] order=${orderGid} all rotation products already received by this subscription — rotating from scratch at index=${selectedIndex}`);
+      console.log(`[rotation] order=${orderGid} all rotation batches already received by this subscription — rotating from scratch at index=${selectedIndex}`);
     } else {
       selectedIndex = found;
     }
   }
 
-  const nextItem = activeItems[selectedIndex];
+  const selectedBatch = batches[selectedIndex];
   const newIndex = (selectedIndex + 1) % n;
-  const nextItemPid = toNumericId(nextItem.productId);
-  console.log(`[rotation] order=${orderGid} selected rotation product index=${selectedIndex} productId=${nextItemPid} title="${nextItem.productTitle}" skipMatchBy=${mode}`);
+  const targetNumericId = toNumericId(group.targetProductId);
 
-  // On a successful rotation, append the selected product to BOTH lists. Once the full set
-  // has been received, reset both to [] so the next cycle rotates from scratch (per spec).
-  const updatedIds = [...purchasedIds, idOf(nextItem)];
-  const updatedTitles = [...purchasedTitles, titleOf(nextItem)];
-  const coversAll = activeItems.every((it) =>
-    mode === "PRODUCT_TITLE" ? updatedTitles.includes(titleOf(it)) : updatedIds.includes(idOf(it))
-  );
-  const newIdsJson    = coversAll ? serializePurchased([]) : serializePurchased(updatedIds);
-  const newTitlesJson = coversAll ? serializePurchased([]) : serializePurchased(updatedTitles);
-  if (coversAll) console.log(`[rotation] order=${orderGid} rotation cycle complete — purchased history reset`);
+  // Self-rotation guard: drop any item that IS the target product (a product accidentally
+  // added to its own rotation). Only the remaining products are actually sent.
+  const batchItems = selectedBatch.items.filter((it) => idOf(it) !== targetNumericId);
+  const sentTitleStr = batchItems.map((it) => it.productTitle).join(", ");
+  const batchLog = { productTitle: sentTitleStr };
 
-  if (nextItemPid === toNumericId(group.targetProductId)) {
+  console.log(`[rotation] order=${orderGid} selected batch index=${selectedIndex} products=[${selectedBatch.items.map((it) => `${idOf(it)}:"${it.productTitle}"`).join(", ")}] skipMatchBy=${mode}`);
+
+  // Whole batch was just the target product → nothing to send. Advance index + log SKIPPED.
+  if (batchItems.length === 0) {
     const claimed = await db.subscriptionInstance.updateMany({
       where: {
         id: instance.id,
@@ -237,13 +267,29 @@ async function rotateOrderItems(shop, orderGid, instance, group, targetLineItems
       console.log(`[rotation] order=${orderGid} self-rotation slot already claimed by concurrent or sequential run`);
       return;
     }
-    console.log(`[rotation] order=${orderGid} rotation item at index=${selectedIndex} is the target product — skipping self-rotation, advancing index`);
-    await writeLog(shop, orderGid, instance, nextItem, group, "SKIPPED", "Rotation item is the target product — self-rotation skipped");
+    console.log(`[rotation] order=${orderGid} batch at index=${selectedIndex} contains only the target product — skipping self-rotation, advancing index`);
+    await writeLog(shop, orderGid, instance, { productTitle: selectedBatch.items[0]?.productTitle ?? "" }, group, "SKIPPED", "Rotation batch is the target product — self-rotation skipped");
     return;
   }
 
+  // On a successful rotation, append every sent product to BOTH lists. Once the full set of
+  // all sendable rotation products has been received, reset both to [] so the next cycle
+  // rotates from scratch (per spec). Target-product items never get sent, so they're excluded
+  // from the "covers all" check (otherwise it could never complete).
+  const allSendableItems = activeItems.filter((it) => idOf(it) !== targetNumericId);
+  const sentIds = batchItems.map(idOf);
+  const sentTitles = batchItems.map(titleOf);
+  const updatedIds = [...purchasedIds, ...sentIds];
+  const updatedTitles = [...purchasedTitles, ...sentTitles];
+  const coversAll = allSendableItems.every((it) =>
+    mode === "PRODUCT_TITLE" ? updatedTitles.includes(titleOf(it)) : updatedIds.includes(idOf(it))
+  );
+  const newIdsJson    = coversAll ? serializePurchased([]) : serializePurchased(updatedIds);
+  const newTitlesJson = coversAll ? serializePurchased([]) : serializePurchased(updatedTitles);
+  if (coversAll) console.log(`[rotation] order=${orderGid} rotation cycle complete — purchased history reset`);
+
   // ── Optimistic lock ────────────────────────────────────────────────────────
-  // Atomically advance currentIndex, persist purchasedProductIds, AND record which order
+  // Atomically advance currentIndex, persist the purchased lists, AND record which order
   // we're processing. Two conditions must both be true for a run to win:
   //   1. currentIndex still matches what we read (prevents concurrent runs from
   //      claiming the same slot from different webhook deliveries at the same time)
@@ -252,8 +298,7 @@ async function rotateOrderItems(shop, orderGid, instance, group, targetLineItems
   //      Run 2 arrives 7s later and would see index=1 and win slot 1→2 for the
   //      same order. With lastProcessedOrderId, Run 2 loses because Run 1 already
   //      stamped this order, even before writing the SUCCESS log.)
-  // purchasedProductIds is written here and rolled back on failure — this gives the
-  // required "append the selected productId after a successful rotation" behaviour.
+  // The purchased lists are written here and rolled back on failure.
   const claimed = await db.subscriptionInstance.updateMany({
     where: {
       id: instance.id,
@@ -268,7 +313,7 @@ async function rotateOrderItems(shop, orderGid, instance, group, targetLineItems
     return;
   }
 
-  console.log(`[rotation] order=${orderGid} claimed slot index=${selectedIndex}→${newIndex}`);
+  console.log(`[rotation] order=${orderGid} claimed slot index=${selectedIndex}→${newIndex} (${batchItems.length} product${batchItems.length !== 1 ? "s" : ""})`);
 
   // Roll currentIndex AND both purchased lists back to their pre-claim values.
   const rollback = () =>
@@ -281,31 +326,37 @@ async function rotateOrderItems(shop, orderGid, instance, group, targetLineItems
       },
     });
 
-  // Manual-review subscriptions STILL rotate (so the customer gets a product) but are
+  // Manual-review subscriptions STILL rotate (so the customer gets the products) but are
   // left UNFULFILLED and logged as MANUAL so a human can verify before fulfilling (spec #6).
   const isManual = instance.status === STATUS_MANUAL;
   const successStatus = isManual ? "MANUAL" : "SUCCESS";
-  // Auto-fulfill is per rotation product (nextItem.autoFulfill), falling back to the group
-  // default when the product hasn't overridden it. Never auto-fulfill a manual-review order.
-  const itemAutoFulfill = nextItem.autoFulfill ?? group.autoFulfill ?? false;
-  const allowFulfill = itemAutoFulfill && !isManual;
+
+  // Auto-fulfill each sent product whose effective auto-fulfill (item override, else group
+  // default) is on. Never auto-fulfill a manual-review order.
+  const fulfillBatch = async () => {
+    if (isManual) {
+      console.log(`[rotation] order=${orderGid} NEEDS_MANUAL_REVIEW — rotation products added but left UNFULFILLED`);
+      return;
+    }
+    for (const item of batchItems) {
+      const itemAutoFulfill = item.autoFulfill ?? group.autoFulfill ?? false;
+      if (!itemAutoFulfill) continue;
+      try {
+        await autoFulfillRotationItems(admin, orderGid, item.productId);
+      } catch (fulfillErr) {
+        console.warn(`[rotation] order=${orderGid} autoFulfill error for product=${idOf(item)} (non-fatal): ${fulfillErr.message}`);
+      }
+    }
+  };
 
   try {
     await performOrderEdit({
-      admin, orderGid, targetLineItems, nextItem, currency,
+      admin, orderGid, targetLineItems, batch: batchItems, currency,
       freeRotation: group.freeRotation ?? false,
       keepTargetProduct: group.keepTargetProduct ?? false,
     });
-    if (allowFulfill) {
-      try {
-        await autoFulfillRotationItems(admin, orderGid, nextItem.productId);
-      } catch (fulfillErr) {
-        console.warn(`[rotation] order=${orderGid} autoFulfill error (non-fatal): ${fulfillErr.message}`);
-      }
-    } else if (isManual) {
-      console.log(`[rotation] order=${orderGid} NEEDS_MANUAL_REVIEW — rotation product added but left UNFULFILLED`);
-    }
-    await writeLog(shop, orderGid, instance, nextItem, group, successStatus, isManual ? MANUAL_REVIEW_MESSAGE : null);
+    await fulfillBatch();
+    await writeLog(shop, orderGid, instance, batchLog, group, successStatus, isManual ? MANUAL_REVIEW_MESSAGE : null);
   } catch (err) {
     if (err.concurrent) {
       if (err.message.includes("Order already processed by concurrent webhook run")) {
@@ -315,31 +366,25 @@ async function rotateOrderItems(shop, orderGid, instance, group, targetLineItems
         await rollback();
       } else {
         // Commit failed — order is likely already fulfilled (Shopify rejects removing
-        // fulfilled line items). Retry as additive: add rotation product without
-        // removing the original. Customer gets both; Digital Downloads fulfills the new item.
+        // fulfilled line items). Retry as additive: add rotation products without
+        // removing the original. Customer gets both; Digital Downloads fulfills the new items.
         console.warn(`[rotation] order=${orderGid} commit failed, retrying as additive edit`);
         try {
           await performOrderEdit({
-            admin, orderGid, targetLineItems, nextItem, currency,
+            admin, orderGid, targetLineItems, batch: batchItems, currency,
             freeRotation: group.freeRotation ?? false,
             keepTargetProduct: false,
             skipZeroOut: true,
           });
-          if (allowFulfill) {
-            try {
-              await autoFulfillRotationItems(admin, orderGid, nextItem.productId);
-            } catch (fulfillErr) {
-              console.warn(`[rotation] order=${orderGid} autoFulfill error (non-fatal): ${fulfillErr.message}`);
-            }
-          }
-          await writeLog(shop, orderGid, instance, nextItem, group, successStatus,
-            isManual ? MANUAL_REVIEW_MESSAGE : "Additive rotation — product added alongside fulfilled original");
+          await fulfillBatch();
+          await writeLog(shop, orderGid, instance, batchLog, group, successStatus,
+            isManual ? MANUAL_REVIEW_MESSAGE : "Additive rotation — products added alongside fulfilled original");
           console.log(`[rotation] order=${orderGid} additive edit succeeded`);
         } catch (retryErr) {
           // Both attempts failed — roll back index so next renewal retries this slot
           console.warn(`[rotation] order=${orderGid} additive retry also failed: ${retryErr.message}`);
           await rollback();
-          await writeLog(shop, orderGid, instance, nextItem, group, "FAILED",
+          await writeLog(shop, orderGid, instance, batchLog, group, "FAILED",
             `Both edit attempts failed: ${retryErr.message}`);
         }
       }
@@ -347,7 +392,7 @@ async function rotateOrderItems(shop, orderGid, instance, group, targetLineItems
     }
     // Unexpected error — roll back index and re-throw
     await rollback();
-    await writeLog(shop, orderGid, instance, nextItem, group, "FAILED", err.message);
+    await writeLog(shop, orderGid, instance, batchLog, group, "FAILED", err.message);
     throw err;
   }
 }

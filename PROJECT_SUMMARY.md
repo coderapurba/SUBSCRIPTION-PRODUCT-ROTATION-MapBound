@@ -30,10 +30,11 @@ This is a **Shopify embedded app** for subscription product rotation, designed t
 
 **The core idea:**
 - A merchant sets up a "Rotation Group" for a subscription product (the *target product*)
-- They add an ordered list of *rotation products* (the replacement sequence)
-- When a **Loop renewal order** arrives, the app automatically swaps the original subscription product for the next product in the rotation sequence
+- They add an ordered list of *rotation products*, organised into **renewal steps (batches)** — each step holds one *or more* products
+- When a **Loop renewal order** arrives, the app automatically swaps the original subscription product for the products of the next step in the sequence
+- A step with one product = a normal single-product swap. A step with multiple products sends them all together in that renewal, with the subscription price split evenly across them
 - Prices are matched using Shopify's Order Edit API (discounts are applied so the customer always pays what they originally subscribed to)
-- After the last rotation product, the sequence cycles back to position 1
+- After the last step, the sequence cycles back to step 1
 
 **Example:**
 > Customer subscribes to "100,000 Whys (Copy)" for $43.95/month.
@@ -141,7 +142,9 @@ skipMatchBy        — "PRODUCT_ID" | "PRODUCT_TITLE": how the "already received
 ```
 
 ### `RotationItem`
-The ordered list of replacement products for a group. Each item = one product that the subscription will be swapped TO.
+The replacement products for a group, organised into **renewal steps (batches)**. Each renewal sends the
+products of ONE step. A step with a single product is a normal one-product rotation; a step with multiple
+products sends them all together in one renewal (see "Batched renewals" below).
 
 ```
 id (cuid)
@@ -150,12 +153,21 @@ productId     — GID
 variantId     — GID of the default/fallback variant
 productTitle
 variantTitle  — e.g. "Teen Boys", "Default Title"
-sortOrder     — 0-based integer; determines rotation order
+sortOrder     — 0-based integer; orders products WITHIN a step
+stepIndex     — Int?; renewal-step (batch) number. Items sharing a stepIndex are sent together.
+                null = legacy singleton (its own step). See stepOf() below.
 isActive      — when false, item is skipped during rotation
 autoFulfill   — per-product auto-fulfill override (Boolean?); null = inherit RotationGroup.autoFulfill
 imageUrl      — cached product thumbnail
 price         — cached variant price (display only)
 ```
+
+**Batched renewals (`stepIndex`)** — `stepOf(item) = item.stepIndex ?? item.sortOrder`. Items are grouped
+into batches by `stepOf` (ordered ascending); products within a batch are ordered by `sortOrder`.
+`SubscriptionInstance.currentIndex` indexes **batches**, not individual items. `stepIndex` is **nullable** so
+existing rows need no data migration: legacy items have `stepIndex = null` → `stepOf = sortOrder` → each is
+its own singleton batch → identical one-product-per-renewal behaviour. The group-detail UI normalises a
+group's items to explicit `stepIndex` values the first time it is edited.
 
 ### `SubscriptionInstance`
 One row per customer subscription. Tracks WHERE in the rotation sequence that customer currently is, and which rotation products have already been received.
@@ -249,28 +261,31 @@ For each active RotationGroup with matching target line items:
 
 ### `rotateOrderItems()` — selection, skip, and persistence
 
+`buildBatches(activeItems)` groups active items into ordered renewal steps (see `stepOf` in Section 4).
+`currentIndex` indexes **batches**. A single-product batch behaves exactly like the old single-item rotation.
+
 ```
-1. activeItems = group.rotationItems (active, sorted). If empty → log SKIPPED.
+1. activeItems = group.rotationItems (active). If empty → log SKIPPED.
+   batches = buildBatches(activeItems); n = batches.length.
 2. SKIP LOGIC (only when group.skipEnabled; skipMatchBy = PRODUCT_ID | PRODUCT_TITLE):
-   - Read the purchased set from the matching column (ids or lowercased titles).
-   - Walk forward from currentIndex to the first product NOT yet received.
-   - If ALL have been received → stop skipping and rotate from currentIndex (cycle
-     starts over).
-   - When skipEnabled is false → no skip; rotate strictly by currentIndex. (The purchased
-     lists are still maintained, so re-enabling later resumes skipping correctly.)
-3. SELF-ROTATION GUARD: if the selected product === target product → advance + log
-   SKIPPED, return.
+   - A batch counts as "received" only when ALL its products are in the purchased set.
+   - Walk forward from currentIndex to the first batch NOT fully received.
+   - If ALL batches received → stop skipping and rotate from currentIndex (cycle restarts).
+   - skipEnabled false → no skip; rotate strictly by currentIndex (sequential: step 1,2,3…).
+     This is the toggle that controls sequencing: OFF = strict sequential, ON = skip received.
+3. SELF-ROTATION GUARD: drop any batch item whose productId === target product. If the batch
+   is then empty → advance + log SKIPPED, return.
 4. OPTIMISTIC LOCK (atomic updateMany on currentIndex + lastProcessedOrderId):
    advances currentIndex, stamps the order, and writes BOTH purchased columns
-   (append selected; reset both to [] when the full set is now covered). Rolled back
-   on failure.
-5. performOrderEdit() (see Section 6).
-6. autoFulfillRotationItems() — ONLY if the selected product's effective auto-fulfill
-   is on (nextItem.autoFulfill ?? group.autoFulfill) AND the instance is not
-   NEEDS_MANUAL_REVIEW. Manual-review rotations are always left unfulfilled.
-7. Log SUCCESS (or MANUAL for a NEEDS_MANUAL_REVIEW instance, with the manual-review
-   message). On error: roll back, log FAILED. err.concurrent → silent return / additive
-   retry for already-fulfilled orders.
+   (append ALL sent batch products; reset both to [] when every sendable product is now
+   covered). Rolled back on failure.
+5. performOrderEdit({ ..., batch: batchItems }) (see Section 6).
+6. autoFulfillRotationItems() — looped over each sent product whose effective auto-fulfill
+   is on (item.autoFulfill ?? group.autoFulfill) AND the instance is not NEEDS_MANUAL_REVIEW.
+   Manual-review rotations are always left unfulfilled.
+7. Log SUCCESS (or MANUAL …); rotationProductTitle = the batch's product titles joined.
+   On error: roll back, log FAILED. err.concurrent → silent return / additive retry for
+   already-fulfilled orders.
 ```
 
 ### Helpers
@@ -282,12 +297,22 @@ For each active RotationGroup with matching target line items:
 
 ## 6. Order Edit Flow
 
-**File:** `app/services/order-edit.server.js` → `performOrderEdit({ admin, orderGid, targetLineItems, nextItem, currency, freeRotation, keepTargetProduct, skipZeroOut })`
+**File:** `app/services/order-edit.server.js` → `performOrderEdit({ admin, orderGid, targetLineItems, batch, currency, freeRotation, keepTargetProduct, skipZeroOut })`
+
+`batch` is the array of rotation products to add this renewal. The function branches on batch size:
+- **`batch.length === 1`** → single-product path (Case 1/Case 2 variant matching + `addUnitsExact` full
+  price-match), described in the steps below. Covers all legacy/single-product groups unchanged.
+- **`batch.length > 1`** → multi-product even-split path: the original subscription total
+  (`Σ round(lineTotal(li)*100)`) is divided **evenly** across the batch products (the last product absorbs
+  the leftover cent so the total is exact). Each product is added at qty 1 using its stored default variant;
+  `discount = freeRotation ? fullPrice : max(0, realPrice − share)`. (Variant-title matching is a 1:1 swap
+  concept that doesn't apply to a curated batch.) Edge: if a product's real price is below its share it
+  simply isn't discounted (order ends slightly under the subscription total).
 
 **Flags:**
-- `freeRotation` — apply a 100% discount so the rotation product is free to the customer.
-- `keepTargetProduct` — do NOT zero out the original subscription product; leave it in the order and just add the rotation product alongside it (no remove + re-add churn).
-- `skipZeroOut` — additive-retry mode: used when the first attempt's commit fails because the order is already fulfilled (Shopify rejects removing fulfilled line items). Adds the rotation product without removing the original.
+- `freeRotation` — apply a 100% discount so the rotation product(s) are free to the customer.
+- `keepTargetProduct` — do NOT zero out the original subscription product; leave it in the order and just add the rotation product(s) alongside it (no remove + re-add churn).
+- `skipZeroOut` — additive-retry mode: used when the first attempt's commit fails because the order is already fulfilled (Shopify rejects removing fulfilled line items). Adds the rotation product(s) without removing the original.
 
 ### Step 1: Determine Case 1 vs Case 2
 
@@ -353,12 +378,17 @@ Loop subscription orders set `final_line_price = "0.00"` on renewal. So:
 
 | `intent` value | What it does |
 |---|---|
-| `updateGroup` | Save group settings: `isActive`, `freeRotation`, `keepTargetProduct`, `autoFulfill`, `skipMatchBy` (resets instances' purchased lists if `skipMatchBy` changed) |
+| `updateGroup` | Save group settings: `isActive`, `freeRotation`, `keepTargetProduct`, `autoFulfill`, `skipEnabled`, `skipMatchBy` (resets instances' purchased lists if `skipMatchBy` changed) |
 | `deleteGroup` | Delete group (cascades to rotation items) → redirect to list |
-| `addItem` | Add a rotation item at the end of the sequence |
-| `toggleItem` | Toggle `isActive` on a single item |
-| `deleteItem` | Delete item, renumber remaining `sortOrder` values |
-| `moveItem` | Swap `sortOrder` with the item above or below |
+| `addItem` | Add a product to a renewal step. `stepMode=new` → new step at the end (`stepIndex = maxStep+1`); `stepMode=existing` + `stepIndex` → into that step. Runs `normalizeSteps()` first. |
+| `toggleItem` | Toggle `isActive` on a single product |
+| `toggleItemAutoFulfill` | Flip a product's effective auto-fulfill and store it as an explicit override |
+| `deleteItem` | Delete a product (an emptied step disappears automatically) |
+| `moveItem` | Reorder a product WITHIN its step (swap `sortOrder` with the neighbour in the same step) |
+| `moveStep` | Reorder a whole renewal step up/down (swap `stepIndex` with the neighbouring step, moving all its products) |
+
+`normalizeSteps(rotationGroupId)` makes every item's `stepIndex` explicit (`stepIndex ?? sortOrder`) before
+step-aware mutations; idempotent, a no-op once normalised.
 
 ---
 
@@ -563,5 +593,5 @@ Before going live:
 
 ---
 
-*Last updated: June 2026 — renewal rotation is contract-authoritative via the Loop Flow endpoint; persisted skip lists (`purchasedProductIds` / `purchasedProductTitles`) with `skipMatchBy`; old-subscription backfill + `NEEDS_MANUAL_REVIEW` safety.*
+*Last updated: June 2026 — multi-product renewal steps (batches) via `RotationItem.stepIndex` (`stepOf = stepIndex ?? sortOrder`); multi-product batches split the subscription price evenly; sequencing controlled by the Skip Already-Received toggle (OFF = strict sequential, ON = skip received batches). Earlier: renewal rotation is contract-authoritative via the Loop Flow endpoint; persisted skip lists (`purchasedProductIds` / `purchasedProductTitles`) with `skipMatchBy`; old-subscription backfill + `NEEDS_MANUAL_REVIEW` safety.*
 *Developer: coderapurba*

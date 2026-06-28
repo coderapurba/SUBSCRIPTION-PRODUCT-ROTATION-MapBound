@@ -69,6 +69,24 @@ export const loader = async ({ request, params }) => {
 
 // ─── Action ───────────────────────────────────────────────────────────────────
 
+// A "renewal step" (batch) groups rotation items by stepIndex. Legacy items have
+// stepIndex = null (each is its own step via stepOf = stepIndex ?? sortOrder). Before any
+// step-aware mutation we make every item's stepIndex explicit so the new UI can manage steps
+// cleanly. Idempotent — a no-op once normalized.
+async function normalizeSteps(rotationGroupId) {
+  const items = await db.rotationItem.findMany({
+    where: { rotationGroupId },
+    orderBy: { sortOrder: "asc" },
+  });
+  if (items.some((it) => it.stepIndex == null)) {
+    await Promise.all(
+      items.map((it) =>
+        db.rotationItem.update({ where: { id: it.id }, data: { stepIndex: it.stepIndex ?? it.sortOrder } })
+      )
+    );
+  }
+}
+
 export const action = async ({ request, params }) => {
   const { session } = await authenticate.admin(request);
   const shop = session.shop;
@@ -121,19 +139,31 @@ export const action = async ({ request, params }) => {
     const variantTitle = fd.get("variantTitle")?.toString().trim();
     const price        = fd.get("price")?.toString().trim();
     const imageUrl     = fd.get("imageUrl")?.toString().trim();
+    const stepMode     = fd.get("stepMode")?.toString();          // "new" | "existing"
+    const stepIndexRaw = fd.get("stepIndex")?.toString();
 
     if (!productId || !variantId || !productTitle) return { error: "Select a product and variant." };
 
-    const max = await db.rotationItem.aggregate({
+    await normalizeSteps(params.id);
+
+    const agg = await db.rotationItem.aggregate({
       where: { rotationGroupId: params.id },
-      _max: { sortOrder: true },
+      _max: { sortOrder: true, stepIndex: true },
     });
-    const nextOrder = (max._max.sortOrder ?? -1) + 1;
+    const nextOrder = (agg._max.sortOrder ?? -1) + 1;
+
+    // Add to an existing renewal step, or start a new step at the end of the sequence.
+    let stepIndex;
+    if (stepMode === "existing" && stepIndexRaw !== undefined && stepIndexRaw !== "") {
+      stepIndex = parseInt(stepIndexRaw, 10);
+    } else {
+      stepIndex = (agg._max.stepIndex ?? -1) + 1;
+    }
 
     await db.rotationItem.create({
-      data: { rotationGroupId: params.id, productId, variantId, productTitle, variantTitle: variantTitle || null, price: price || null, imageUrl: imageUrl || null, sortOrder: nextOrder, isActive: true },
+      data: { rotationGroupId: params.id, productId, variantId, productTitle, variantTitle: variantTitle || null, price: price || null, imageUrl: imageUrl || null, sortOrder: nextOrder, stepIndex, isActive: true },
     });
-    return { success: "Item added to rotation." };
+    return { success: "Product added to rotation." };
   }
 
   if (intent === "toggleItem") {
@@ -159,23 +189,54 @@ export const action = async ({ request, params }) => {
 
   if (intent === "deleteItem") {
     const itemId = fd.get("itemId");
+    // Just delete — stepIndex drives batches, so a step with no remaining items simply
+    // disappears. Gaps in sortOrder/stepIndex are harmless (buildBatches sorts by them).
     await db.rotationItem.delete({ where: { id: itemId } });
-    const remaining = await db.rotationItem.findMany({ where: { rotationGroupId: params.id }, orderBy: { sortOrder: "asc" } });
-    await Promise.all(remaining.map((item, idx) => db.rotationItem.update({ where: { id: item.id }, data: { sortOrder: idx } })));
     return null;
   }
 
+  // Reorder a product WITHIN its renewal step (swap sortOrder with the item above/below it
+  // in the same step).
   if (intent === "moveItem") {
+    await normalizeSteps(params.id);
     const itemId = fd.get("itemId");
     const dir = fd.get("direction");
-    const items = await db.rotationItem.findMany({ where: { rotationGroupId: params.id }, orderBy: { sortOrder: "asc" } });
-    const idx = items.findIndex((i) => i.id === itemId);
+    const all = await db.rotationItem.findMany({ where: { rotationGroupId: params.id }, orderBy: { sortOrder: "asc" } });
+    const current = all.find((i) => i.id === itemId);
+    if (!current) return null;
+    const sameStep = all.filter((i) => i.stepIndex === current.stepIndex);
+    const idx = sameStep.findIndex((i) => i.id === itemId);
     const swapIdx = dir === "up" ? idx - 1 : idx + 1;
-    if (swapIdx < 0 || swapIdx >= items.length) return null;
+    if (swapIdx < 0 || swapIdx >= sameStep.length) return null;
     await Promise.all([
-      db.rotationItem.update({ where: { id: items[idx].id },     data: { sortOrder: items[swapIdx].sortOrder } }),
-      db.rotationItem.update({ where: { id: items[swapIdx].id }, data: { sortOrder: items[idx].sortOrder } }),
+      db.rotationItem.update({ where: { id: sameStep[idx].id },     data: { sortOrder: sameStep[swapIdx].sortOrder } }),
+      db.rotationItem.update({ where: { id: sameStep[swapIdx].id }, data: { sortOrder: sameStep[idx].sortOrder } }),
     ]);
+    return null;
+  }
+
+  // Reorder a whole renewal step up/down (swap stepIndex with the neighbouring step, moving
+  // all of its products together).
+  if (intent === "moveStep") {
+    await normalizeSteps(params.id);
+    const stepIndex = parseInt(fd.get("stepIndex"), 10);
+    const dir = fd.get("direction");
+    const items = await db.rotationItem.findMany({ where: { rotationGroupId: params.id } });
+    const stepKeys = [...new Set(items.map((i) => i.stepIndex))].sort((a, b) => a - b);
+    const pos = stepKeys.indexOf(stepIndex);
+    const swapPos = dir === "up" ? pos - 1 : pos + 1;
+    if (pos === -1 || swapPos < 0 || swapPos >= stepKeys.length) return null;
+    const otherStep = stepKeys[swapPos];
+    await Promise.all(
+      items
+        .filter((it) => it.stepIndex === stepIndex || it.stepIndex === otherStep)
+        .map((it) =>
+          db.rotationItem.update({
+            where: { id: it.id },
+            data: { stepIndex: it.stepIndex === stepIndex ? otherStep : stepIndex },
+          })
+        )
+    );
     return null;
   }
 
@@ -203,10 +264,11 @@ export default function RotationGroupDetail() {
       <s-section slot="aside" heading="Rotation Logic">
         <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
           {[
-            { icon: "✅", text: "Only active items are used in rotation" },
-            { icon: "↕️",  text: "Position determines order; use ▲▼ to reorder" },
-            { icon: "🔀", text: "If variants match subscription variants, each is swapped individually (Case 2)" },
-            { icon: "📦", text: "Otherwise, default variant is used at combined quantity and price (Case 1)" },
+            { icon: "✅", text: "Only active products are used in rotation" },
+            { icon: "📅", text: "Each renewal sends one renewal step; steps cycle back to step 1 after the last" },
+            { icon: "🧺", text: "A step with multiple products sends them all together; the subscription price is split evenly across them" },
+            { icon: "↕️",  text: "Use ▲▼ on a step to reorder steps, and on a product to reorder it within its step" },
+            { icon: "🔀", text: "Single-product steps: if variants match, each is swapped individually (Case 2), else the default variant is used (Case 1)" },
           ].map(({ icon, text }, i) => (
             <div key={i} style={{ display: "flex", gap: "10px", alignItems: "flex-start" }}>
               <span style={{ fontSize: "16px", flexShrink: 0 }}>{icon}</span>
@@ -220,7 +282,8 @@ export default function RotationGroupDetail() {
         <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
           <InfoRow label="Group ID"   value={<code style={codeStyle}>{group.id}</code>} />
           <InfoRow label="Created"    value={new Date(group.createdAt).toLocaleString()} />
-          <InfoRow label="Items"      value={`${group.rotationItems.length} rotation products`} />
+          <InfoRow label="Steps"      value={`${buildBatchesClient(group.rotationItems).length} renewal steps`} />
+          <InfoRow label="Products"   value={`${group.rotationItems.length} rotation products`} />
         </div>
       </s-section>
 
@@ -468,8 +531,8 @@ function GroupSettingsSection({ group }) {
             </div>
             <div style={{ fontSize: "12px", color: "#6d7175", lineHeight: "1.5", paddingLeft: "24px" }}>
               {skipEnabled
-                ? "Rotation products the customer already received are skipped — the next not-yet-received product is sent."
-                : "Skip check is off — products rotate strictly in sequence, even if the customer already received one."}
+                ? "Renewal steps whose products the customer already received are skipped — the next not-yet-received step is sent."
+                : "Skip check is off — renewal steps run strictly in sequence (step 1, 2, 3 …), even if the customer already received some products."}
             </div>
           </div>
 
@@ -558,47 +621,54 @@ function GroupSettingsSection({ group }) {
 
 // ─── Rotation Sequence Section ────────────────────────────────────────────────
 
+// Group rotation items into ordered renewal steps (batches). Mirrors the server's stepOf
+// rule: stepOf = stepIndex ?? sortOrder. Items sharing a step are sent together in one renewal.
+function buildBatchesClient(items) {
+  const stepOf = (it) => (it.stepIndex != null ? it.stepIndex : it.sortOrder);
+  const byStep = new Map();
+  for (const it of items) {
+    const k = stepOf(it);
+    if (!byStep.has(k)) byStep.set(k, []);
+    byStep.get(k).push(it);
+  }
+  return [...byStep.keys()]
+    .sort((a, b) => a - b)
+    .map((k) => ({
+      stepIndex: k,
+      items: byStep.get(k).slice().sort((a, b) => a.sortOrder - b.sortOrder),
+    }));
+}
+
 function RotationSequenceSection({ group }) {
+  const batches = buildBatchesClient(group.rotationItems);
+  const productCount = group.rotationItems.length;
+
   return (
-    <s-section heading={`Rotation Sequence (${group.rotationItems.length} item${group.rotationItems.length !== 1 ? "s" : ""})`}>
-      <div style={{ fontSize: "13px", color: "#6d7175", marginBottom: "20px" }}>
-        Products rotate in order on each renewal. After the last item, the sequence cycles back to position 1.
+    <s-section heading={`Rotation Sequence (${batches.length} renewal step${batches.length !== 1 ? "s" : ""} · ${productCount} product${productCount !== 1 ? "s" : ""})`}>
+      <div style={{ fontSize: "13px", color: "#6d7175", marginBottom: "20px", lineHeight: "1.6" }}>
+        Each renewal sends the products in <strong>one renewal step</strong>. Steps run in order; after the
+        last step the sequence cycles back to step 1. A step with a single product behaves like a normal
+        one-product rotation; a step with multiple products sends them all together in that renewal (the
+        original subscription price is split evenly across them, unless Free Rotation is on).
       </div>
 
-      {group.rotationItems.length > 0 ? (
-        <div style={{ border: "1px solid #e1e3e5", borderRadius: "8px", marginBottom: "24px" }}>
-          <div style={{ overflowX: "auto" }}>
-          <table style={{ ...tableStyle, minWidth: "680px" }}>
-            <thead>
-              <tr>
-                <th style={th}>#</th>
-                <th style={th}>Product</th>
-                <th style={th}>Default Variant</th>
-                <th style={th}>Price</th>
-                <th style={th}>Status</th>
-                <th style={th}>Auto-Fulfill</th>
-                <th style={th}>Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {group.rotationItems.map((item, idx) => (
-                <RotationItemRow
-                  key={item.id}
-                  item={item}
-                  idx={idx}
-                  isFirst={idx === 0}
-                  isLast={idx === group.rotationItems.length - 1}
-                  groupAutoFulfill={group.autoFulfill ?? false}
-                />
-              ))}
-            </tbody>
-          </table>
-          </div>
+      {batches.length > 0 ? (
+        <div style={{ display: "flex", flexDirection: "column", gap: "16px", marginBottom: "24px" }}>
+          {batches.map((batch, bIdx) => (
+            <BatchCard
+              key={batch.stepIndex}
+              batch={batch}
+              displayNum={bIdx + 1}
+              isFirstStep={bIdx === 0}
+              isLastStep={bIdx === batches.length - 1}
+              groupAutoFulfill={group.autoFulfill ?? false}
+            />
+          ))}
         </div>
       ) : (
         <div style={emptySequence}>
           <div style={{ fontSize: "32px", marginBottom: "10px" }}>📋</div>
-          <div style={{ fontSize: "14px", fontWeight: "600", color: "#303030", marginBottom: "4px" }}>No rotation items yet</div>
+          <div style={{ fontSize: "14px", fontWeight: "600", color: "#303030", marginBottom: "4px" }}>No rotation products yet</div>
           <div style={{ fontSize: "13px", color: "#6d7175" }}>Search and add products below to build the rotation sequence</div>
         </div>
       )}
@@ -606,9 +676,61 @@ function RotationSequenceSection({ group }) {
       {/* Add item form */}
       <div style={{ borderTop: "1px solid #e1e3e5", paddingTop: "20px" }}>
         <div style={{ fontSize: "14px", fontWeight: "600", color: "#303030", marginBottom: "16px" }}>+ Add Rotation Product</div>
-        <AddItemForm />
+        <AddItemForm batches={batches} />
       </div>
     </s-section>
+  );
+}
+
+// ─── Batch (renewal step) card ────────────────────────────────────────────────
+
+function BatchCard({ batch, displayNum, isFirstStep, isLastStep, groupAutoFulfill }) {
+  const fetcher = useFetcher();
+  const isBusy = fetcher.state !== "idle";
+  const moveStep = (direction) =>
+    fetcher.submit({ intent: "moveStep", stepIndex: String(batch.stepIndex), direction }, { method: "post" });
+
+  return (
+    <div style={{ border: "1px solid #e1e3e5", borderRadius: "10px", overflow: "hidden", opacity: isBusy ? 0.6 : 1, transition: "opacity 0.15s" }}>
+      {/* Step header */}
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "10px", padding: "10px 14px", background: "#f6f6f7", borderBottom: "1px solid #e1e3e5" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+          <span style={stepBadge}>Renewal Step {displayNum}</span>
+          <span style={{ fontSize: "12px", color: "#6d7175" }}>{batch.items.length} product{batch.items.length !== 1 ? "s" : ""}</span>
+        </div>
+        <div style={{ display: "flex", gap: "4px" }}>
+          <button type="button" onClick={() => moveStep("up")}   disabled={isFirstStep || isBusy} style={{ ...iconBtn, opacity: isFirstStep ? 0.3 : 1 }} title="Move step up">▲</button>
+          <button type="button" onClick={() => moveStep("down")} disabled={isLastStep  || isBusy} style={{ ...iconBtn, opacity: isLastStep  ? 0.3 : 1 }} title="Move step down">▼</button>
+        </div>
+      </div>
+
+      {/* Products in this step */}
+      <div style={{ overflowX: "auto" }}>
+        <table style={{ ...tableStyle, minWidth: "640px" }}>
+          <thead>
+            <tr>
+              <th style={th}>Product</th>
+              <th style={th}>Default Variant</th>
+              <th style={th}>Price</th>
+              <th style={th}>Status</th>
+              <th style={th}>Auto-Fulfill</th>
+              <th style={th}>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {batch.items.map((item, idx) => (
+              <RotationItemRow
+                key={item.id}
+                item={item}
+                isFirst={idx === 0}
+                isLast={idx === batch.items.length - 1}
+                groupAutoFulfill={groupAutoFulfill}
+              />
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
   );
 }
 
@@ -642,7 +764,7 @@ function ConfirmModal({ isOpen, icon, title, message, confirmLabel, confirmStyle
 
 // ─── Item Row ─────────────────────────────────────────────────────────────────
 
-function RotationItemRow({ item, idx, isFirst, isLast, groupAutoFulfill }) {
+function RotationItemRow({ item, isFirst, isLast, groupAutoFulfill }) {
   const fetcher = useFetcher();
   const [showRemoveModal, setShowRemoveModal] = useState(false);
   const isBusy = fetcher.state !== "idle";
@@ -678,9 +800,6 @@ function RotationItemRow({ item, idx, isFirst, isLast, groupAutoFulfill }) {
       />
 
       <tr style={{ borderBottom: "1px solid #f1f2f3", opacity: isBusy ? 0.6 : 1, transition: "opacity 0.15s" }}>
-        <td style={td}>
-          <div style={posNumber}>{idx + 1}</div>
-        </td>
         <td style={td}>
           <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
             {item.imageUrl
@@ -733,8 +852,8 @@ function RotationItemRow({ item, idx, isFirst, isLast, groupAutoFulfill }) {
         </td>
         <td style={{ ...td, whiteSpace: "nowrap" }}>
           <div style={{ display: "flex", gap: "4px", alignItems: "center" }}>
-            <button type="button" onClick={() => submit("moveItem", { direction: "up" })}   disabled={isFirst || isBusy} style={{ ...iconBtn, opacity: isFirst ? 0.3 : 1 }} title="Move up">▲</button>
-            <button type="button" onClick={() => submit("moveItem", { direction: "down" })} disabled={isLast  || isBusy} style={{ ...iconBtn, opacity: isLast  ? 0.3 : 1 }} title="Move down">▼</button>
+            <button type="button" onClick={() => submit("moveItem", { direction: "up" })}   disabled={isFirst || isBusy} style={{ ...iconBtn, opacity: isFirst ? 0.3 : 1 }} title="Move up within step">▲</button>
+            <button type="button" onClick={() => submit("moveItem", { direction: "down" })} disabled={isLast  || isBusy} style={{ ...iconBtn, opacity: isLast  ? 0.3 : 1 }} title="Move down within step">▼</button>
             <button type="button" onClick={() => submit("toggleItem")} disabled={isBusy} style={smallSecBtn} title={item.isActive ? "Pause this item" : "Activate this item"}>
               {item.isActive ? "Pause" : "Activate"}
             </button>
@@ -754,11 +873,13 @@ function RotationItemRow({ item, idx, isFirst, isLast, groupAutoFulfill }) {
 
 // ─── Add Item Form ────────────────────────────────────────────────────────────
 
-function AddItemForm() {
+function AddItemForm({ batches = [] }) {
   const fetcher = useFetcher();
   const [query, setQuery] = useState("");
   const [selectedProduct, setSelectedProduct] = useState(null);
   const [selectedVariant, setSelectedVariant] = useState(null);
+  // "new" = start a new renewal step; "existing:<stepIndex>" = add to that step.
+  const [stepChoice, setStepChoice] = useState("new");
 
   const searchResults = fetcher.data?.searchProducts ?? [];
   const isSearching = fetcher.state === "loading";
@@ -780,6 +901,7 @@ function AddItemForm() {
 
   function handleAdd() {
     if (!selectedProduct || !selectedVariant) return;
+    const [stepMode, stepIndex] = stepChoice === "new" ? ["new", ""] : ["existing", stepChoice.split(":")[1]];
     fetcher.submit({
       intent: "addItem",
       productId:    selectedProduct.id,
@@ -788,10 +910,13 @@ function AddItemForm() {
       variantTitle: selectedVariant.title,
       price:        selectedVariant.price,
       imageUrl:     selectedProduct.featuredImage?.url ?? "",
+      stepMode,
+      stepIndex,
     }, { method: "post" });
     setQuery("");
     setSelectedProduct(null);
     setSelectedVariant(null);
+    setStepChoice("new");
   }
 
   return (
@@ -865,6 +990,25 @@ function AddItemForm() {
           </select>
           <div style={{ fontSize: "12px", color: "#6d7175", marginTop: "5px" }}>
             Used when subscription variants don't match (Case 1 fallback)
+          </div>
+        </div>
+      )}
+
+      {/* Renewal step selector */}
+      {selectedProduct && (
+        <div>
+          <label style={labelStyle}>Add to renewal step</label>
+          <select value={stepChoice} onChange={(e) => setStepChoice(e.target.value)} style={selectStyle}>
+            <option value="new">➕ New renewal step (step {batches.length + 1})</option>
+            {batches.map((b, i) => (
+              <option key={b.stepIndex} value={`existing:${b.stepIndex}`}>
+                Add to Renewal Step {i + 1} ({b.items.length} product{b.items.length !== 1 ? "s" : ""})
+              </option>
+            ))}
+          </select>
+          <div style={{ fontSize: "12px", color: "#6d7175", marginTop: "5px" }}>
+            A <strong>new step</strong> sends this product on its own renewal. Adding to an
+            <strong> existing step</strong> sends it together with that step's other products in one renewal.
           </div>
         </div>
       )}
@@ -1047,6 +1191,7 @@ const badgeInactive = { background: "#f6f6f7", color: "#6d7175", fontSize: "11px
 
 const targetThumb  = { width: "64px", height: "64px", objectFit: "cover", borderRadius: "8px", flexShrink: 0, border: "1px solid #d9dadb" };
 const posNumber    = { width: "26px", height: "26px", borderRadius: "50%", background: "#303030", color: "#fff", fontSize: "11px", fontWeight: "700", display: "flex", alignItems: "center", justifyContent: "center" };
+const stepBadge    = { background: "#303030", color: "#fff", fontSize: "12px", fontWeight: "700", padding: "4px 12px", borderRadius: "14px", letterSpacing: "0.2px" };
 const itemThumb    = { width: "40px", height: "40px", objectFit: "cover", borderRadius: "6px", flexShrink: 0, border: "1px solid #e1e3e5" };
 const emptySequence = { textAlign: "center", padding: "36px 20px", background: "#fafafa", borderRadius: "8px", border: "1px dashed #c9cccf", marginBottom: "24px" };
 
